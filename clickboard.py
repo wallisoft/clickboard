@@ -1,791 +1,695 @@
 #!/usr/bin/env python3
 """
-clickboard.py — a manually-launched tray app for bidirectional
-clipboard sync between machines over SSH.
+Clickboard - the clipboard that follows you between machines.
 
-Click a machine in the tray menu to CONNECT it (or disconnect if
-already connected). While connected, clipboard changes on either
-machine are pushed to the other automatically — no further clicking
-needed. Nothing syncs until you've explicitly connected that machine.
-
-Tray icon: orange = no machines connected, green = at least one is.
-
-Tested platform: Ubuntu 24.04 <-> Ubuntu 24.04 (xclip on both ends).
-
-Requirements (pip install -r requirements.txt):
-  pystray, pillow, pyperclip, paramiko
-(everything else used — urllib, secrets, hashlib, subprocess — is
-stdlib, so the pairing feature adds no new dependencies)
-
-SSH setup: use "Test connection" in Configure to check a machine, or
-"Pair devices..." to exchange SSH keys automatically via a small
-self-hosted broker (see clickboard-pair.php) instead of manually
-running ssh-copy-id on both ends.
+Sign in with your Tiny-Web API key on each machine. Machines on the same
+account find each other through the Tiny-Web API, then connect directly
+over the local network using mutual TLS: each machine only trusts the
+certificates registered to its own account, so other people on the same
+Wi-Fi can't connect. Clipboard contents go machine to machine and never
+touch the server.
 """
-
-import base64
+import datetime
 import hashlib
 import json
-import queue
-import secrets
+import os
+import platform
+import shutil
 import socket
-import sys
-import getpass
+import ssl
+import struct
 import subprocess
+import sys
 import threading
 import time
-import tkinter as tk
 import urllib.error
-import urllib.parse
 import urllib.request
-from dataclasses import dataclass, asdict, field
+import uuid
+import webbrowser
 from pathlib import Path
-from tkinter import ttk, messagebox
 
-import paramiko
 import pyperclip
 import pystray
 from PIL import Image, ImageDraw
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
-CONFIG_DIR = Path.home() / ".config" / "clickboard"
+VERSION = "2.0.0"
+API_BASE = "https://tiny-web.uk/api/"
+SIGNUP_URL = "https://clickboard.eur.bz/#signup"
+DEFAULT_PORT = 47800
+REGISTER_EVERY = 60       # seconds between check-ins with Tiny-Web
+DIAL_EVERY = 5            # seconds between attempts to reach unconnected machines
+POLL_EVERY = 0.4          # seconds between local clipboard checks
+PING_EVERY = 20           # keepalive; a link silent for 3x this is dropped
+MAX_CLIP_BYTES = 10 * 1024 * 1024
+
+if platform.system() == "Windows":
+    CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "Clickboard"
+else:
+    CONFIG_DIR = Path.home() / ".config" / "clickboard"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-SSH_DIR = Path.home() / ".ssh"
-SSH_KEY_PATH = SSH_DIR / "id_ed25519"
+CERT_FILE = CONFIG_DIR / "cert.pem"
+KEY_FILE = CONFIG_DIR / "key.pem"
 
-# Placeholder — point this at wherever you deploy clickboard-pair.php.
-DEFAULT_PAIRING_API_URL = "https://api.tiny-web.uk/pair.php"
-
-def _migrate_api_url(url: str) -> str:
-    """Upgrade configs saved with the old placeholder broker URL."""
-    if not url or "clickboard-pair.php" in url or "pair.tiny-web.uk" in url:
-        return DEFAULT_PAIRING_API_URL
-    return url
-
-# Commands run over SSH don't know about the desktop session, so find it:
-# X11 socket + Xauthority, or the Wayland socket.
-REMOTE_ENV = r"""
-export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-if [ -z "$WAYLAND_DISPLAY" ]; then
-  w=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep -m1 '^wayland-[0-9]*$')
-  [ -n "$w" ] && export WAYLAND_DISPLAY=$w
-fi
-if [ -z "$DISPLAY" ]; then
-  x=$(ls /tmp/.X11-unix 2>/dev/null | sed -n 's/^X//p' | head -1)
-  [ -n "$x" ] && export DISPLAY=:$x
-fi
-if [ -z "$XAUTHORITY" ]; then
-  for f in "$XDG_RUNTIME_DIR"/gdm/Xauthority "$XDG_RUNTIME_DIR"/.mutter-Xwaylandauth.* "$HOME/.Xauthority"; do
-    [ -f "$f" ] && export XAUTHORITY=$f && break
-  done
-fi
-"""
-
-REMOTE_GET_SCRIPT = r"""
-set -e
-if command -v xclip >/dev/null 2>&1; then
-  xclip -selection clipboard -o 2>/dev/null | base64 -w0
-elif command -v xsel >/dev/null 2>&1; then
-  xsel --clipboard --output 2>/dev/null | base64 -w0
-elif command -v wl-paste >/dev/null 2>&1; then
-  wl-paste 2>/dev/null | base64 -w0
-elif command -v powershell.exe >/dev/null 2>&1; then
-  powershell.exe -NoProfile -Command Get-Clipboard 2>/dev/null | tr -d '\r' | base64 -w0
-else
-  echo "clickboard: no clipboard tool found on remote" >&2
-  exit 1
-fi
-"""
-
-REMOTE_SET_SCRIPT = r"""
-set -e
-if command -v xclip >/dev/null 2>&1; then
-  base64 -d | xclip -selection clipboard -i
-elif command -v xsel >/dev/null 2>&1; then
-  base64 -d | xsel --clipboard --input
-elif command -v wl-copy >/dev/null 2>&1; then
-  base64 -d | wl-copy
-elif command -v clip.exe >/dev/null 2>&1; then
-  base64 -d | clip.exe
-else
-  echo "clickboard: no clipboard tool found on remote" >&2
-  exit 1
-fi
-"""
+COLOUR_OK = (13, 148, 136, 255)       # teal: at least one machine connected
+COLOUR_IDLE = (140, 140, 140, 255)    # grey: nothing connected yet
+COLOUR_WARN = (217, 119, 6, 255)      # amber: needs attention (no key, error)
 
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
-
-@dataclass
-class MachineConfig:
-    name: str
-    host: str
-    user: str
-    port: int = 22
-    key_path: str = ""
+def log(msg):
+    print(f"[clickboard {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
-@dataclass
-class AppConfig:
-    machines: list = field(default_factory=list)
-    poll_interval: float = 1.0
-    pairing_api_url: str = DEFAULT_PAIRING_API_URL
+# -- Config ------------------------------------------------------------------
 
-    @staticmethod
-    def load():
+class Config:
+    FIELDS = ("api_key", "device_id", "name", "port", "paused")
+
+    def __init__(self):
+        self.api_key = ""
+        self.device_id = str(uuid.uuid4())
+        self.name = "".join(c for c in socket.gethostname().split(".")[0] if c.isalnum() or c in " .-_")[:64] or "machine"
+        self.port = DEFAULT_PORT
+        self.paused = False
+
+    @classmethod
+    def load(cls):
+        cfg = cls()
         if CONFIG_FILE.exists():
-            raw = json.loads(CONFIG_FILE.read_text())
-            machines = [MachineConfig(**m) for m in raw.get("machines", [])]
-            return AppConfig(
-                machines=machines,
-                poll_interval=raw.get("poll_interval", 1.0),
-                pairing_api_url=_migrate_api_url(raw.get("pairing_api_url", DEFAULT_PAIRING_API_URL)),
-            )
-        return AppConfig()
+            try:
+                raw = json.loads(CONFIG_FILE.read_text())
+                for k in cls.FIELDS:
+                    if k in raw:
+                        setattr(cfg, k, raw[k])
+            except Exception as exc:
+                log(f"config unreadable, starting fresh: {exc}")
+        cfg.save()
+        return cfg
 
     def save(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        data = {
-            "machines": [asdict(m) for m in self.machines],
-            "poll_interval": self.poll_interval,
-            "pairing_api_url": self.pairing_api_url,
-        }
-        CONFIG_FILE.write_text(json.dumps(data, indent=2))
-
-
-def ssh_connect_kwargs(cfg: MachineConfig, timeout=6):
-    kwargs = dict(
-        hostname=cfg.host,
-        port=cfg.port,
-        username=cfg.user,
-        timeout=timeout,
-        banner_timeout=timeout,
-        look_for_keys=True,
-        allow_agent=True,
-    )
-    if cfg.key_path:
-        kwargs["key_filename"] = cfg.key_path
-    return kwargs
-
-
-def ssh_setup_steps(cfg: MachineConfig, error: str):
-    """Structured setup steps (description, command) so the UI can
-    render each one individually copyable, rather than one text blob."""
-    header = (
-        f"Couldn't connect to {cfg.user}@{cfg.host}:{cfg.port}.\n\n"
-        f"Error: {error}\n\n"
-        "Follow these steps, then remember Clickboard needs this "
-        f"working in BOTH directions — repeat on {cfg.host}, pointing "
-        "back at this machine, too. (Or use \"Pair devices...\" instead "
-        "to do both directions automatically.)"
-    )
-    steps = [
-        ("Generate a key on THIS machine, if you don't already have one:",
-         "ssh-keygen -t ed25519"),
-        ("Copy your public key to the remote machine:",
-         f"ssh-copy-id -p {cfg.port} {cfg.user}@{cfg.host}"),
-        ("Test it manually:",
-         f"ssh -p {cfg.port} {cfg.user}@{cfg.host}"),
-    ]
-    return header, steps
-
-
-# --------------------------------------------------------------------------
-# Keypair + pairing helpers
-# --------------------------------------------------------------------------
-
-def ensure_local_keypair() -> Path:
-    """Returns the path to a local ed25519 private key, generating a
-    passphrase-less one if none exists yet (needed for the automated
-    sync loop to connect without a human typing a passphrase each
-    time — consistent with the rest of the app's passwordless-SSH
-    assumption)."""
-    if SSH_KEY_PATH.exists():
-        return SSH_KEY_PATH
-    SSH_DIR.mkdir(mode=0o700, exist_ok=True)
-    subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-f", str(SSH_KEY_PATH), "-N", ""],
-        check=True, capture_output=True,
-    )
-    return SSH_KEY_PATH
-
-
-def read_local_pubkey() -> str:
-    pub_path = SSH_KEY_PATH.with_suffix(".pub")
-    return pub_path.read_text().strip()
-
-
-def key_fingerprint(pubkey_line: str) -> str:
-    """OpenSSH-style SHA256 fingerprint, e.g. 'SHA256:abcd...' — the
-    same format `ssh-keygen -lf` prints, so it's recognisable."""
-    parts = pubkey_line.strip().split()
-    if len(parts) < 2:
-        return "(unrecognised key format)"
-    key_bytes = base64.b64decode(parts[1])
-    digest = hashlib.sha256(key_bytes).digest()
-    b64 = base64.b64encode(digest).decode().rstrip("=")
-    return f"SHA256:{b64}"
-
-
-def add_to_authorized_keys(pubkey_line: str) -> bool:
-    """Appends a key to ~/.ssh/authorized_keys if not already present.
-    Returns True if it was added, False if it was already there."""
-    auth_path = SSH_DIR / "authorized_keys"
-    SSH_DIR.mkdir(mode=0o700, exist_ok=True)
-    existing = auth_path.read_text() if auth_path.exists() else ""
-    key_material = pubkey_line.strip().split()[1] if len(pubkey_line.split()) >= 2 else pubkey_line
-    if key_material in existing:
-        return False
-    with open(auth_path, "a") as f:
-        if existing and not existing.endswith("\n"):
-            f.write("\n")
-        f.write(pubkey_line.strip() + "\n")
-    auth_path.chmod(0o600)
-    return True
-
-
-def pairing_post(api_url: str, code: str, label: str, pubkey: str, timeout=8) -> dict:
-    body = json.dumps({"code": code, "label": label, "pubkey": pubkey}).encode()
-    req = urllib.request.Request(api_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
-
-
-def pairing_get(api_url: str, code: str, timeout=8) -> dict:
-    url = f"{api_url}?code={urllib.parse.quote(code)}"
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
-
-
-def generate_pairing_code() -> str:
-    return secrets.token_hex(5).upper()  # 10 hex chars, e.g. "3F9A0B21CE"
-
-
-# --------------------------------------------------------------------------
-# Per-machine connection worker (continuous sync while connected)
-# --------------------------------------------------------------------------
-
-class MachineWorker:
-    def __init__(self, cfg: MachineConfig, poll_interval: float, on_status_change):
-        self.cfg = cfg
-        self.poll_interval = poll_interval
-        self.on_status_change = on_status_change
-        self._client = None
-        self._thread = None
-        self._stop = threading.Event()
-        self.connected = False
-        self.last_error = ""
-        self._last_local = ""
-        self._last_remote = ""
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._client:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-        self._set_connected(False)
-
-    def is_running(self):
-        return bool(self._thread and self._thread.is_alive())
-
-    def _set_connected(self, value: bool):
-        if value != self.connected:
-            self.connected = value
-            self.on_status_change(self.cfg.name, value)
-
-    def _connect(self):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(**ssh_connect_kwargs(self.cfg))
-        transport = client.get_transport()
-        transport.set_keepalive(5)
-        self._client = client
-
-    def _remote_exec(self, script: str, stdin_data: bytes = None) -> bytes:
-        stdin, stdout, stderr = self._client.exec_command(REMOTE_ENV + script, timeout=8)
-        if stdin_data is not None:
-            stdin.write(stdin_data)
-            stdin.channel.shutdown_write()
-        out = stdout.read()
-        err = stderr.read()
-        if err and not out:
-            self.last_error = err.decode(errors="replace").strip()
-            print(f"[clickboard] {self.cfg.name}: remote error: {self.last_error}", file=sys.stderr, flush=True)
-        return out
-
-    def _run(self):
-        backoff = 1
-        max_backoff = 30
-        while not self._stop.is_set():
-            try:
-                self._connect()
-                self._set_connected(True)
-                self.last_error = ""
-                backoff = 1
-
-                while not self._stop.is_set():
-                    try:
-                        local_val = pyperclip.paste()
-                    except Exception:
-                        local_val = self._last_local
-
-                    if local_val and local_val != self._last_local and local_val != self._last_remote:
-                        encoded = base64.b64encode(local_val.encode()).decode()
-                        self._remote_exec(REMOTE_SET_SCRIPT, (encoded + "\n").encode())
-                        self._last_local = local_val
-
-                    remote_out = self._remote_exec(REMOTE_GET_SCRIPT)
-                    if remote_out:
-                        try:
-                            remote_val = base64.b64decode(remote_out).decode(errors="replace")
-                        except Exception:
-                            remote_val = ""
-                        if remote_val and remote_val != self._last_remote and remote_val != self._last_local:
-                            pyperclip.copy(remote_val)
-                            self._last_remote = remote_val
-                            self._last_local = remote_val
-
-                    time.sleep(self.poll_interval)
-
-            except Exception as exc:
-                self.last_error = str(exc)
-                print(f"[clickboard] {self.cfg.name}: {exc}", file=sys.stderr, flush=True)
-                self._set_connected(False)
-                if self._stop.is_set():
-                    break
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-
-        self._set_connected(False)
-
-
-# --------------------------------------------------------------------------
-# Tray application
-# --------------------------------------------------------------------------
-
-class TrayApp:
-    def __init__(self):
-        self.config = AppConfig.load()
-        self.workers = {}
-        self._rebuild_workers()
-        self._config_lock = threading.Lock()
-        self._config_open = False
-
-        self.icon = pystray.Icon(
-            "clickboard",
-            icon=self._make_icon("orange"),
-            title="clickboard (idle)",
-            menu=pystray.Menu(self._build_menu),
-        )
-
-    def _rebuild_workers(self):
-        existing = set(self.workers)
-        wanted = set(m.name for m in self.config.machines)
-        for name in existing - wanted:
-            self.workers[name].stop()
-            del self.workers[name]
-        for m in self.config.machines:
-            if m.name not in self.workers:
-                self.workers[m.name] = MachineWorker(m, self.config.poll_interval, self._on_status_change)
-            else:
-                self.workers[m.name].cfg = m
-
-    def _on_status_change(self, name, connected):
-        self._refresh_icon()
-
-    def _make_icon(self, color: str) -> Image.Image:
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        pad = 4
-        draw.ellipse([pad, pad, size - pad, size - pad], fill=color)
-        return img
-
-    def _refresh_icon(self):
-        any_connected = any(w.connected for w in self.workers.values())
-        self.icon.icon = self._make_icon("green" if any_connected else "orange")
-        n = sum(1 for w in self.workers.values() if w.connected)
-        self.icon.title = f"clickboard ({n} connected)" if n else "clickboard (idle)"
-
-    def _build_menu(self):
-        n_connected = sum(1 for w in self.workers.values() if w.connected)
-        items = [
-            pystray.MenuItem(f"Status: {n_connected} connected", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-        ]
-        if not self.workers:
-            items.append(pystray.MenuItem("No machines configured", None, enabled=False))
-        else:
-            for name, worker in self.workers.items():
-                dot = "\u25cf" if worker.connected else "\u25cb"
-                label = f"{dot} {name} ({worker.cfg.host})"
-                items.append(pystray.MenuItem(label, self._make_toggle(name)))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Reconnect all", self._reconnect_all))
-        items.append(pystray.MenuItem("Configure...", self._request_config_window))
-        items.append(pystray.Menu.SEPARATOR)
-        items.append(pystray.MenuItem("Quit", self._quit))
-        return items
-
-    def _make_toggle(self, name):
-        def toggle(icon, item):
-            worker = self.workers[name]
-            if worker.is_running():
-                worker.stop()
-            else:
-                worker.start()
-            self._refresh_icon()
-        return toggle
-
-    def _reconnect_all(self, icon, item):
-        for worker in self.workers.values():
-            worker.stop()
-        for worker in self.workers.values():
-            worker.start()
-
-    def _quit(self, icon, item):
-        for worker in self.workers.values():
-            worker.stop()
-        icon.stop()
-
-    # -- config window ---------------------------------------------------
-
-    def _request_config_window(self, icon, item):
-        with self._config_lock:
-            if self._config_open:
-                return
-            self._config_open = True
-        threading.Thread(target=self._run_config_window, daemon=True).start()
-
-    def _run_config_window(self):
+        CONFIG_FILE.write_text(json.dumps({k: getattr(self, k) for k in self.FIELDS}, indent=2))
         try:
-            root = tk.Tk()
-            def _edit_menu(event):
-                w = event.widget
-                m = tk.Menu(w, tearoff=0)
-                m.add_command(label="Cut", command=lambda: w.event_generate("<<Cut>>"))
-                m.add_command(label="Copy", command=lambda: w.event_generate("<<Copy>>"))
-                m.add_command(label="Paste", command=lambda: w.event_generate("<<Paste>>"))
-                m.add_separator()
-                m.add_command(label="Select all", command=lambda: w.select_range(0, "end"))
-                w.focus_set()
-                m.tk_popup(event.x_root, event.y_root)
-            root.bind_class("TEntry", "<Button-3>", _edit_menu)
-            root.bind_class("Entry", "<Button-3>", _edit_menu)
-            root.title("clickboard \u2014 configure machines")
-            self._build_config_ui(root)
-            root.update_idletasks()
-            root.minsize(root.winfo_width(), root.winfo_height())
-            root.lift()
-            root.attributes("-topmost", True)
-            root.after(300, lambda: root.attributes("-topmost", False))
-            root.after(100, root.focus_force)
-            root.mainloop()
-        finally:
-            with self._config_lock:
-                self._config_open = False
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
 
-    def _build_config_ui(self, win):
-        # Pairing API URL, editable so it's not hardcoded per deployment.
-        api_frame = ttk.Frame(win)
-        api_frame.pack(fill="x", padx=10, pady=(10, 0))
-        ttk.Label(api_frame, text="Pairing API URL:").pack(side="left")
-        api_entry = ttk.Entry(api_frame, width=45)
-        api_entry.insert(0, self.config.pairing_api_url)
-        api_entry.pack(side="left", padx=5, fill="x", expand=True)
 
-        def save_api_url():
-            self.config.pairing_api_url = api_entry.get().strip()
-            self.config.save()
+# -- Identity: a self-signed certificate per machine -------------------------
 
-        api_entry.bind("<FocusOut>", lambda e: save_api_url())
+def ensure_identity(device_id: str) -> str:
+    """Create this machine's TLS certificate on first run; return it as PEM."""
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return CERT_FILE.read_text()
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"clickboard-{device_id}")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        # Self-signed and marked as its own CA, so a sibling can load it
+        # directly as a trust anchor for mutual TLS.
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=True,
+            crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    try:
+        os.chmod(KEY_FILE, 0o600)
+    except OSError:
+        pass
+    pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    CERT_FILE.write_text(pem)
+    log("created this machine's certificate")
+    return pem
 
-        listbox = tk.Listbox(win, height=8)
-        listbox.pack(fill="both", expand=True, padx=10, pady=(10, 5))
-        for m in self.config.machines:
-            listbox.insert("end", f"{m.name}  \u2014  {m.user}@{m.host}:{m.port}")
 
-        form = ttk.Frame(win)
-        form.pack(fill="x", padx=10, pady=5)
+def der_fingerprint(der: bytes) -> str:
+    return hashlib.sha256(der).hexdigest()
 
-        fields = {}
-        for i, label in enumerate(["Name", "Host", "User", "Port", "Key path (optional)"]):
-            ttk.Label(form, text=label).grid(row=i, column=0, sticky="w")
-            entry = ttk.Entry(form, width=32)
-            entry.grid(row=i, column=1, sticky="w", pady=2)
-            fields[label] = entry
-        fields["Port"].insert(0, "22")
 
-        def load_selected(_event=None):
-            sel = listbox.curselection()
-            if not sel:
-                return
-            m = self.config.machines[sel[0]]
-            fields["Name"].delete(0, "end"); fields["Name"].insert(0, m.name)
-            fields["Host"].delete(0, "end"); fields["Host"].insert(0, m.host)
-            fields["User"].delete(0, "end"); fields["User"].insert(0, m.user)
-            fields["Port"].delete(0, "end"); fields["Port"].insert(0, str(m.port))
-            fields["Key path (optional)"].delete(0, "end"); fields["Key path (optional)"].insert(0, m.key_path)
+def lan_addrs() -> list:
+    addrs = set()
+    try:
+        # Connecting a UDP socket sends nothing; it just picks the outgoing interface.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))
+        addrs.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                addrs.add(ip)
+    except OSError:
+        pass
+    return sorted(addrs)
 
-        listbox.bind("<<ListboxSelect>>", load_selected)
 
-        def current_form_cfg():
-            name = fields["Name"].get().strip() or "(test)"
-            host = fields["Host"].get().strip()
-            user = fields["User"].get().strip()
-            port_str = fields["Port"].get().strip() or "22"
-            key_path = fields["Key path (optional)"].get().strip()
-            try:
-                port = int(port_str)
-            except ValueError:
-                port = 22
-            return MachineConfig(name, host, user, port, key_path)
+# -- Tiny-Web API ------------------------------------------------------------
 
-        def test_connection():
-            cfg = current_form_cfg()
-            if not (cfg.host and cfg.user):
-                messagebox.showerror("clickboard", "Enter at least Host and User before testing.")
-                return
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                client.connect(**ssh_connect_kwargs(cfg, timeout=6))
-                stdin, stdout, stderr = client.exec_command("echo ok", timeout=6)
-                out = stdout.read().decode(errors="replace").strip()
-                client.close()
-                if out == "ok":
-                    messagebox.showinfo("clickboard", f"Connected successfully to {cfg.user}@{cfg.host}:{cfg.port}.")
-                else:
-                    messagebox.showwarning("clickboard", f"Connected, but got unexpected output: {out!r}")
-            except Exception as exc:
-                header, steps = ssh_setup_steps(cfg, str(exc))
-                show_help_dialog(win, "clickboard \u2014 connection failed", header, steps)
+def api_post(endpoint: str, api_key: str, payload: dict, timeout=10) -> dict:
+    req = urllib.request.Request(
+        API_BASE + endpoint,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": f"Clickboard/{VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read())
+        except Exception:
+            return {"ok": False, "error": f"Tiny-Web returned HTTP {exc.code}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Can't reach Tiny-Web: {exc}"}
 
-        def add_or_update():
-            cfg = current_form_cfg()
-            if not (cfg.host and cfg.user and fields["Name"].get().strip()):
-                messagebox.showerror("clickboard", "Name, host and user are required.")
-                return
-            existing_names = [m.name for m in self.config.machines]
-            if cfg.name in existing_names:
-                self.config.machines[existing_names.index(cfg.name)] = cfg
-            else:
-                self.config.machines.append(cfg)
-            self.config.save()
-            self._rebuild_workers()
-            self._refresh_icon()
-            refresh_listbox()
 
-        def remove_selected():
-            sel = listbox.curselection()
-            if not sel:
-                return
-            m = self.config.machines.pop(sel[0])
-            if m.name in self.workers:
-                self.workers[m.name].stop()
-                del self.workers[m.name]
-            self.config.save()
-            self._refresh_icon()
-            refresh_listbox()
+# -- Wire protocol: [4-byte header length][JSON header][payload bytes] -------
 
-        def refresh_listbox():
-            listbox.delete(0, "end")
-            for m in self.config.machines:
-                listbox.insert("end", f"{m.name}  \u2014  {m.user}@{m.host}:{m.port}")
+def recv_exact(sock, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf += chunk
+    return bytes(buf)
 
-        def add_paired(label):
-            user, _, host = label.partition("@")
-            if not host:  # older peer sent only a hostname
-                user, host = getpass.getuser(), label
-            short = host.split(".")[0]
-            cfg = MachineConfig(name=short, host=f"{short}.local", user=user)
-            names = [m.name for m in self.config.machines]
-            if short in names:
-                self.config.machines[names.index(short)] = cfg
-            else:
-                self.config.machines.append(cfg)
-            self.config.save()
-            self._rebuild_workers()
-            self._refresh_icon()
-            refresh_listbox()
 
-        def open_pairing():
-            open_pairing_dialog(win, self.config.pairing_api_url, on_paired=add_paired)
+def recv_frame(sock):
+    (hlen,) = struct.unpack(">I", recv_exact(sock, 4))
+    if hlen > 65536:
+        raise ValueError("header too large")
+    header = json.loads(recv_exact(sock, hlen))
+    size = int(header.get("size", 0))
+    if size < 0 or size > MAX_CLIP_BYTES:
+        raise ValueError("payload too large")
+    return header, (recv_exact(sock, size) if size else b"")
 
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(btns, text="Test connection", command=test_connection).pack(side="left")
-        ttk.Button(btns, text="Pair devices...", command=open_pairing).pack(side="left", padx=5)
-        ttk.Button(btns, text="Add / Update", command=add_or_update).pack(side="left", padx=5)
-        ttk.Button(btns, text="Remove selected", command=remove_selected).pack(side="left")
-        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+class Link:
+    """One live TLS connection to a sibling machine."""
+
+    def __init__(self, app, sock, peer_id: str, initiator: str):
+        self.app = app
+        self.sock = sock
+        self.peer_id = peer_id
+        self.initiator = initiator
+        self.alive = True
+        self._send_lock = threading.Lock()
+
+    def send(self, header: dict, payload: bytes = b""):
+        header = dict(header, size=len(payload))
+        h = json.dumps(header).encode()
+        try:
+            with self._send_lock:
+                self.sock.sendall(struct.pack(">I", len(h)) + h + payload)
+        except Exception as exc:
+            self.close(f"send failed: {exc}")
 
     def run(self):
+        self.sock.settimeout(PING_EVERY * 3)
+        try:
+            while self.alive:
+                header, payload = recv_frame(self.sock)
+                if header.get("type") == "clip":
+                    self.app.on_remote_clip(self.peer_id, header, payload)
+        except Exception as exc:
+            self.close(str(exc))
+
+    def close(self, why: str = ""):
+        if not self.alive:
+            return
+        self.alive = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        self.app.on_link_closed(self, why)
+
+
+# -- The app -----------------------------------------------------------------
+
+class App:
+    def __init__(self):
+        self.cfg = Config.load()
+        self.cert_pem = ensure_identity(self.cfg.device_id)
+        self.running = True
+        self.lock = threading.Lock()
+        self.peers = {}            # device_id -> device dict from Tiny-Web
+        self.peers_loaded = False
+        self.links = {}            # device_id -> Link
+        self.plan = None
+        self.status = ""
+        self.warn = False
+        self.last_clip = None
+        self.clip_lock = threading.Lock()
+        self.wake = threading.Event()
+        self._last_wake = 0.0
+        self.icon = None
+        self._settings_open = False
+        self._build_contexts()
+
+    # TLS contexts: trust exactly the certificates registered to this account
+    def _build_contexts(self):
+        pems = [p["cert_pem"] for p in self.peers.values() if p.get("cert_pem")]
+        srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cli = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        cli.check_hostname = False   # identity is the pinned certificate, not a hostname
+        for ctx in (srv, cli):
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            if pems:
+                ctx.load_verify_locations(cadata="\n".join(pems))
+        self.srv_ctx, self.cli_ctx = srv, cli
+
+    # ---- registration / discovery ----
+    def register_loop(self):
+        while self.running:
+            self.register_now()
+            self.wake.wait(REGISTER_EVERY)
+            self.wake.clear()
+
+    def poke_register(self):
+        """Ask for an early check-in (rate-limited), e.g. when an unknown machine knocks."""
+        if time.time() - self._last_wake > 10:
+            self._last_wake = time.time()
+            self.wake.set()
+
+    def register_now(self):
+        if not self.cfg.api_key:
+            self.set_status("Add your Tiny-Web key in Settings", warn=True)
+            return
+        r = api_post("clickboard-register.php", self.cfg.api_key, {
+            "device_id": self.cfg.device_id,
+            "name": self.cfg.name,
+            "platform": {"Windows": "windows", "Darwin": "macos"}.get(platform.system(), "linux"),
+            "lan_addrs": lan_addrs(),
+            "port": self.cfg.port,
+            "cert_pem": self.cert_pem,
+        })
+        if not r.get("ok"):
+            self.set_status(r.get("error", "Registration failed"), warn=True)
+            return
+        self.plan = r.get("plan")
+        fresh = {d["device_id"]: d for d in r.get("devices", [])}
+        joined = [d for pid, d in fresh.items() if pid not in self.peers] if self.peers_loaded else []
+        gone = [pid for pid in self.peers if pid not in fresh]
+        certs_changed = {p.get("cert_fp") for p in fresh.values()} != {p.get("cert_fp") for p in self.peers.values()}
+        self.peers = fresh
+        self.peers_loaded = True
+        if certs_changed:
+            self._build_contexts()
+        for pid in gone:
+            link = self.links.get(pid)
+            if link:
+                link.close("removed from account")
+        for d in joined:
+            self.notify(f"{d['name']} joined your Clickboard. Not yours? Remove it in Settings.")
+        self.set_status("")
+
+    # ---- TLS server ----
+    def serve(self):
+        try:
+            ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ls.bind(("0.0.0.0", self.cfg.port))
+            ls.listen(8)
+        except OSError as exc:
+            self.set_status(f"Can't listen on port {self.cfg.port} (is Clickboard already running?)", warn=True)
+            log(f"listen failed: {exc}")
+            return
+        log(f"listening on port {self.cfg.port}")
+        while self.running:
+            try:
+                conn, addr = ls.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._accept, args=(conn, addr), daemon=True).start()
+
+    def _accept(self, conn, addr):
+        try:
+            conn.settimeout(10)
+            tls = self.srv_ctx.wrap_socket(conn, server_side=True)
+            self._adopt(tls, initiated_by_me=False)
+        except Exception as exc:
+            log(f"refused connection from {addr[0]}: {exc}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # Possibly a sibling that registered after our last check-in.
+            self.poke_register()
+
+    # ---- dialling siblings ----
+    def dial_loop(self):
+        while self.running:
+            for pid, peer in list(self.peers.items()):
+                if not self.running:
+                    break
+                link = self.links.get(pid)
+                if (link and link.alive) or not peer.get("online") or not peer.get("cert_pem") or not peer.get("port"):
+                    continue
+                for addr in peer.get("lan_addrs", []):
+                    try:
+                        sock = socket.create_connection((addr, peer["port"]), timeout=3)
+                        tls = self.cli_ctx.wrap_socket(sock)
+                        self._adopt(tls, initiated_by_me=True)
+                        break
+                    except Exception:
+                        continue
+            time.sleep(DIAL_EVERY)
+
+    def _adopt(self, tls, initiated_by_me: bool):
+        fp = der_fingerprint(tls.getpeercert(binary_form=True))
+        peer = next((p for p in self.peers.values() if p.get("cert_fp") == fp), None)
+        if not peer:
+            tls.close()
+            return
+        pid = peer["device_id"]
+        link = Link(self, tls, pid, self.cfg.device_id if initiated_by_me else pid)
+        preferred = min(self.cfg.device_id, pid)   # both sides agree which duplicate survives
+        replaced = None
+        with self.lock:
+            old = self.links.get(pid)
+            if old and old.alive:
+                if old.initiator == preferred or link.initiator != preferred:
+                    tls.close()
+                    return
+                replaced = old
+            self.links[pid] = link
+        if replaced:
+            replaced.close("replaced by preferred connection")
+        threading.Thread(target=link.run, daemon=True).start()
+        log(f"connected to {peer['name']}")
+        self.refresh_ui()
+
+    def on_link_closed(self, link, why):
+        with self.lock:
+            if self.links.get(link.peer_id) is link:
+                del self.links[link.peer_id]
+        name = self.peers.get(link.peer_id, {}).get("name", link.peer_id[:8])
+        log(f"disconnected from {name}: {why}")
+        self.refresh_ui()
+
+    def ping_loop(self):
+        while self.running:
+            time.sleep(PING_EVERY)
+            for link in list(self.links.values()):
+                link.send({"type": "ping"})
+
+    # ---- clipboard ----
+    def watch_clipboard(self):
+        warned = False
+        try:
+            self.last_clip = pyperclip.paste()   # don't broadcast whatever was there at startup
+        except Exception:
+            pass
+        while self.running:
+            try:
+                text = pyperclip.paste()
+                warned = False
+            except Exception as exc:
+                if not warned:
+                    log(f"can't read the clipboard: {exc}")
+                    warned = True
+                text = None
+            if text is not None:
+                with self.clip_lock:
+                    changed = text != self.last_clip
+                    if changed:
+                        self.last_clip = text
+                if changed and text and not self.cfg.paused:
+                    self.broadcast_text(text)
+            time.sleep(POLL_EVERY)
+
+    def broadcast_text(self, text: str):
+        data = text.encode("utf-8")
+        if len(data) > MAX_CLIP_BYTES:
+            log("clipboard too large to send")
+            return
+        for link in list(self.links.values()):
+            link.send({"type": "clip", "mime": "text/plain;charset=utf-8"}, data)
+
+    def on_remote_clip(self, peer_id, header, payload):
+        if self.cfg.paused:
+            return
+        if str(header.get("mime", "")).startswith("text/plain"):
+            text = payload.decode("utf-8", errors="replace")
+            with self.clip_lock:
+                self.last_clip = text   # so the watcher doesn't bounce it straight back
+                try:
+                    pyperclip.copy(text)
+                except Exception as exc:
+                    log(f"can't write the clipboard: {exc}")
+
+    # ---- UI plumbing ----
+    def set_status(self, text, warn=False):
+        if text != self.status or warn != self.warn:
+            self.status, self.warn = text, warn
+            if text:
+                log(text)
+            self.refresh_ui()
+
+    def notify(self, msg):
+        log(msg)
+        try:
+            if shutil.which("notify-send"):
+                subprocess.Popen(["notify-send", "Clickboard", msg])
+            elif self.icon:
+                self.icon.notify(msg, "Clickboard")
+        except Exception:
+            pass
+
+    def connected_count(self):
+        return sum(1 for link in self.links.values() if link.alive)
+
+    def status_line(self):
+        if self.status:
+            return self.status
+        if self.cfg.paused:
+            return "Paused"
+        n, total = self.connected_count(), len(self.peers)
+        if total == 0:
+            return "No other machines yet - install on another machine"
+        return f"Syncing with {n} of {total} machine{'s' if total != 1 else ''}"
+
+    def refresh_ui(self):
+        if not self.icon:
+            return
+        colour = COLOUR_WARN if self.warn else (COLOUR_OK if self.connected_count() and not self.cfg.paused else COLOUR_IDLE)
+        try:
+            self.icon.icon = icon_image(colour)
+            self.icon.title = f"Clickboard - {self.status_line()}"
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def build_menu(self):
+        items = [pystray.MenuItem(self.status_line(), None, enabled=False), pystray.Menu.SEPARATOR]
+        for p in sorted(self.peers.values(), key=lambda d: d["name"].lower()):
+            link = self.links.get(p["device_id"])
+            mark = "\u25cf " if (link and link.alive) else "\u25cb "
+            items.append(pystray.MenuItem(mark + p["name"], None, enabled=False))
+        if self.peers:
+            items.append(pystray.Menu.SEPARATOR)
+        items += [
+            pystray.MenuItem("Pause sync", self.toggle_pause, checked=lambda item: self.cfg.paused),
+            pystray.MenuItem("Settings...", lambda: self.open_settings()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self.quit),
+        ]
+        return items
+
+    def toggle_pause(self):
+        self.cfg.paused = not self.cfg.paused
+        self.cfg.save()
+        self.refresh_ui()
+
+    def quit(self):
+        self.running = False
+        for link in list(self.links.values()):
+            link.close("quitting")
+        if self.icon:
+            self.icon.stop()
+
+    def open_settings(self):
+        if self._settings_open:
+            return
+        self._settings_open = True
+        threading.Thread(target=self._settings_window, daemon=True).start()
+
+    def _settings_window(self):
+        try:
+            SettingsWindow(self).run()
+        except Exception as exc:
+            log(f"settings window error: {exc}")
+        finally:
+            self._settings_open = False
+
+    def run(self):
+        for target in (self.serve, self.register_loop, self.dial_loop, self.ping_loop, self.watch_clipboard):
+            threading.Thread(target=target, daemon=True).start()
+        self.icon = pystray.Icon("clickboard", icon_image(COLOUR_IDLE), "Clickboard",
+                                 menu=pystray.Menu(lambda: self.build_menu()))
+        if not self.cfg.api_key:
+            threading.Timer(1.0, self.open_settings).start()
         self.icon.run()
 
 
-# --------------------------------------------------------------------------
-# Selectable, individually-copyable SSH help dialog
-# --------------------------------------------------------------------------
-
-def _copy_to_clipboard(widget, text):
-    widget.clipboard_clear()
-    widget.clipboard_append(text)
-    widget.update()
-
-
-def show_help_dialog(parent, title, header_text, steps):
-    """steps: list of (description, command) tuples, each rendered
-    with its own Copy button. header_text is shown in a plain
-    selectable Text widget (not a locked-down messagebox label)."""
-    win = tk.Toplevel(parent)
-    win.title(title)
-
-    outer = ttk.Frame(win, padding=14)
-    outer.pack(fill="both", expand=True)
-
-    header = tk.Text(outer, wrap="word", height=6, relief="flat",
-                      background=win.cget("background"), borderwidth=0)
-    header.insert("1.0", header_text)
-    header.configure(state="normal")  # stays selectable/copyable
-    header.pack(fill="x", pady=(0, 12))
-
-    for desc, cmd in steps:
-        step_frame = ttk.Frame(outer)
-        step_frame.pack(fill="x", pady=6)
-        ttk.Label(step_frame, text=desc, wraplength=520, justify="left").pack(anchor="w")
-
-        row = ttk.Frame(step_frame)
-        row.pack(fill="x", pady=(3, 0))
-        cmd_entry = tk.Entry(row, font=("monospace", 10))
-        cmd_entry.insert(0, cmd)
-        cmd_entry.configure(state="readonly", readonlybackground="white")
-        cmd_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="Copy", width=8,
-                   command=lambda c=cmd: _copy_to_clipboard(win, c)).pack(side="left", padx=(6, 0))
-
-    ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(10, 0))
-
-    win.update_idletasks()
-    # 50% wider than a plain messagebox would be, and only as tall as
-    # the content needs — wide-and-short rather than narrow-and-long.
-    natural_w = max(win.winfo_width(), 600)
-    win.geometry(f"{int(natural_w * 1.0)}x{win.winfo_height()}")
-    win.minsize(natural_w, win.winfo_height())
+def icon_image(colour):
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((14, 10, 50, 58), radius=6, fill=colour)
+    d.rounded_rectangle((24, 4, 40, 16), radius=3, fill=(60, 60, 60, 255))
+    d.line((22, 30, 42, 30), fill=(255, 255, 255, 220), width=3)
+    d.line((22, 40, 36, 40), fill=(255, 255, 255, 220), width=3)
+    return img
 
 
-# --------------------------------------------------------------------------
-# Pairing dialog
-# --------------------------------------------------------------------------
+# -- Settings window ---------------------------------------------------------
 
-def open_pairing_dialog(parent, api_url, on_paired=None):
-    win = tk.Toplevel(parent)
-    win.title("clickboard \u2014 pair devices")
-    outer = ttk.Frame(win, padding=14)
-    outer.pack(fill="both", expand=True)
+class SettingsWindow:
+    def __init__(self, app: App):
+        self.app = app
 
-    ttk.Label(outer, text=(
-        "Generates an SSH key on this machine if needed, then exchanges "
-        "public keys with another machine via a short-lived pairing code. "
-        "Run this on BOTH machines with the SAME code."
-    ), wraplength=480, justify="left").pack(anchor="w", pady=(0, 10))
+    def run(self):
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
+        app = self.app
+        root = tk.Tk()
+        self.root = root
+        root.title("Clickboard settings")
 
-    code_frame = ttk.Frame(outer)
-    code_frame.pack(fill="x", pady=(0, 10))
-    ttk.Label(code_frame, text="Pairing code:").pack(side="left")
-    code_var = tk.StringVar(value=generate_pairing_code())
-    code_entry = ttk.Entry(code_frame, textvariable=code_var, font=("monospace", 12), width=16)
-    code_entry.pack(side="left", padx=6)
-    ttk.Button(code_frame, text="New code", command=lambda: code_var.set(generate_pairing_code())).pack(side="left")
-    ttk.Button(code_frame, text="Copy", command=lambda: _copy_to_clipboard(win, code_var.get())).pack(side="left", padx=4)
+        def edit_menu(event):
+            w = event.widget
+            m = tk.Menu(w, tearoff=0)
+            m.add_command(label="Cut", command=lambda: w.event_generate("<<Cut>>"))
+            m.add_command(label="Copy", command=lambda: w.event_generate("<<Copy>>"))
+            m.add_command(label="Paste", command=lambda: w.event_generate("<<Paste>>"))
+            m.add_separator()
+            m.add_command(label="Select all", command=lambda: w.select_range(0, "end"))
+            w.focus_set()
+            m.tk_popup(event.x_root, event.y_root)
+        root.bind_class("TEntry", "<Button-3>", edit_menu)
 
-    status_var = tk.StringVar(value="Enter/confirm the code, then click Start on both machines.")
-    status_label = ttk.Label(outer, textvariable=status_var, wraplength=480, justify="left")
-    status_label.pack(anchor="w", fill="x", pady=(0, 10))
+        outer = ttk.Frame(root, padding=16)
+        outer.pack(fill="both", expand=True)
 
-    stop_flag = threading.Event()
+        ttk.Label(outer, text="Tiny-Web API key").grid(row=0, column=0, sticky="w")
+        self.key_var = tk.StringVar(value=app.cfg.api_key)
+        key_entry = ttk.Entry(outer, textvariable=self.key_var, width=48, show="\u2022")
+        key_entry.grid(row=1, column=0, sticky="we", pady=(2, 0))
+        ttk.Button(outer, text="Get a free key", command=lambda: webbrowser.open(SIGNUP_URL)).grid(row=1, column=1, padx=(8, 0))
 
-    def do_pair():
-        code = code_var.get().strip()
-        if not code:
-            status_var.set("Enter a pairing code first.")
+        ttk.Label(outer, text="This machine's name").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.name_var = tk.StringVar(value=app.cfg.name)
+        ttk.Entry(outer, textvariable=self.name_var, width=48).grid(row=3, column=0, sticky="we", pady=(2, 0))
+        ttk.Button(outer, text="Save", command=self.save).grid(row=3, column=1, padx=(8, 0))
+
+        self.status_var = tk.StringVar()
+        ttk.Label(outer, textvariable=self.status_var, wraplength=460, foreground="#555").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Label(outer, text="Your machines", font=("TkDefaultFont", 10, "bold")).grid(row=5, column=0, sticky="w", pady=(16, 4))
+        self.list_frame = ttk.Frame(outer)
+        self.list_frame.grid(row=6, column=0, columnspan=2, sticky="we")
+        self._shown = None
+
+        outer.columnconfigure(0, weight=1)
+        self.tick()
+
+        root.update_idletasks()
+        root.minsize(root.winfo_width(), root.winfo_height())
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(300, lambda: root.attributes("-topmost", False))
+        root.after(100, root.focus_force)
+        if not app.cfg.api_key:
+            root.after(150, key_entry.focus_set)
+        root.mainloop()
+
+    def save(self):
+        key = self.key_var.get().strip()
+        name = "".join(c for c in self.name_var.get().strip() if c.isalnum() or c in " .-_")[:64]
+        if not key:
+            self.messagebox.showerror("Clickboard", "Paste your Tiny-Web API key first.\nNo key yet? Click 'Get a free key'.")
             return
-        try:
-            key_path = ensure_local_keypair()
-        except Exception as exc:
-            status_var.set(f"Couldn't generate/find a local SSH key: {exc}")
+        if not name:
+            self.messagebox.showerror("Clickboard", "Give this machine a name.")
             return
+        self.app.cfg.api_key, self.app.cfg.name = key, name
+        self.app.cfg.save()
+        self.app.set_status("Checking in with Tiny-Web...")
+        self.app.wake.set()
 
-        pubkey = read_local_pubkey()
-        label = f"{getpass.getuser()}@{socket.gethostname()}"
-
-        try:
-            pairing_post(api_url, code, label, pubkey)
-        except Exception as exc:
-            status_var.set(f"Couldn't reach pairing API at {api_url}: {exc}")
+    def remove(self, device_id, name):
+        if not self.messagebox.askyesno("Clickboard", f"Remove {name} from your Clickboard?\n\nIt will stop syncing immediately."):
             return
 
-        status_var.set(f"Waiting for the other machine to join with code {code}...")
-        stop_flag.clear()
-        threading.Thread(target=poll_loop, args=(code, label), daemon=True).start()
+        def work():
+            r = api_post("clickboard-remove.php", self.app.cfg.api_key, {"device_id": device_id})
+            if not r.get("ok"):
+                self.app.set_status(r.get("error", "Couldn't remove that machine"), warn=True)
+            self.app.wake.set()
+        threading.Thread(target=work, daemon=True).start()
 
-    def poll_loop(code, my_label):
-        deadline = time.time() + 300  # 5 minutes
-        while time.time() < deadline and not stop_flag.is_set():
-            try:
-                result = pairing_get(api_url, code)
-                entries = result.get("entries", [])
-                other = next((e for e in entries if e["label"] != my_label), None)
-                if other:
-                    win.after(0, lambda: show_confirm(other))
-                    return
-            except Exception:
-                pass
-            time.sleep(2)
-        if not stop_flag.is_set():
-            win.after(0, lambda: status_var.set("Timed out waiting for the other machine. Try a new code."))
+    def tick(self):
+        app = self.app
+        plan = app.plan or {}
+        line = app.status_line()
+        if plan:
+            line += f"\n{plan.get('name', 'Free')} plan \u00b7 {len(app.peers) + 1} of {plan.get('max_devices', '?')} machines in use"
+        self.status_var.set(line)
 
-    def show_confirm(other):
-        fp = key_fingerprint(other["pubkey"])
-        status_var.set(
-            f"Found a machine calling itself \"{other['label']}\".\n\n"
-            f"Fingerprint: {fp}\n\n"
-            f"Check this matches what's shown on {other['label']}'s screen, "
-            "then click Trust and add below."
-        )
+        rows = [("this", app.cfg.name + " (this machine)", True)]
+        for p in sorted(app.peers.values(), key=lambda d: d["name"].lower()):
+            link = app.links.get(p["device_id"])
+            rows.append((p["device_id"], p["name"], bool(link and link.alive)))
+        if rows != self._shown:
+            self._shown = rows
+            for child in self.list_frame.winfo_children():
+                child.destroy()
+            for i, (pid, name, up) in enumerate(rows):
+                self.ttk.Label(self.list_frame, text=("\u25cf " if up else "\u25cb ") + name).grid(row=i, column=0, sticky="w", pady=2)
+                if pid != "this":
+                    self.ttk.Label(self.list_frame, text="connected" if up else "not connected",
+                                   foreground="#0d9488" if up else "#999").grid(row=i, column=1, sticky="w", padx=12)
+                    self.ttk.Button(self.list_frame, text="Remove",
+                                    command=lambda d=pid, n=name: self.remove(d, n)).grid(row=i, column=2, sticky="e")
+            self.list_frame.columnconfigure(1, weight=1)
+        self.root.after(1000, self.tick)
 
-        def trust_and_add():
-            added = add_to_authorized_keys(other["pubkey"])
-            if on_paired:
-                on_paired(other["label"])
-            status_var.set(
-                ("Added" if added else "Already present —")
-                + f" {other['label']}'s key is now authorized on this machine."
-            )
-            trust_btn.pack_forget()
 
-        trust_btn = ttk.Button(outer, text="Trust and add", command=trust_and_add)
-        trust_btn.pack(anchor="w", pady=(0, 10))
-
-    btns = ttk.Frame(outer)
-    btns.pack(fill="x")
-    ttk.Button(btns, text="Start pairing", command=lambda: threading.Thread(target=do_pair, daemon=True).start()).pack(side="left")
-    ttk.Button(btns, text="Close", command=lambda: (stop_flag.set(), win.destroy())).pack(side="right")
-
-    win.update_idletasks()
-    win.minsize(max(win.winfo_width(), 560), win.winfo_height())
+def main():
+    App().run()
 
 
 if __name__ == "__main__":
-    TrayApp().run()
+    main()

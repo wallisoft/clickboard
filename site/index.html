@@ -2,288 +2,240 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>clickboard — clipboard, on click</title>
-<meta name="description" content="A tiny tray app that moves your clipboard between two machines over SSH, only when you tell it to.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clickboard — The clipboard that follows you between machines</title>
+<meta name="description" content="Copy on one machine, paste on another. Clickboard syncs your clipboard across your Linux machines on your local network. Sign in once, and your machines find each other.">
+<meta property="og:title" content="Clickboard — The clipboard that follows you between machines">
+<meta property="og:description" content="Copy on one machine, paste on another. Sign in once, and your machines find each other.">
+<meta property="og:url" content="https://clickboard.eur.bz">
+<link rel="canonical" href="https://clickboard.eur.bz">
+<link rel="stylesheet" href="https://tiny-web.uk/shared/tinyweb.css">
 <style>
-  :root {
-    --bg: #1C1A18;
-    --bg-raised: #23201D;
-    --text: #EDE9E3;
-    --muted: #8A8580;
-    --orange: #F5A623;
-    --green: #3ECF8E;
-    --rule: #38342F;
-    box-sizing: border-box;
-    padding-top: env(safe-area-inset-top, 0px);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
-  * { box-sizing: border-box; }
-  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
-  html, body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'IBM Plex Sans', sans-serif;
-    line-height: 1.55;
-  }
-  .mono { font-family: 'JetBrains Mono', monospace; }
+:root{
+    --site:#0d9488;
+    --siteh:#0f766e;
+    --site-light:#0d94881f;
+    --site-border:#0d94884d;
+}
+section[id]{scroll-margin-top:76px}
+.cb-wrap{max-width:1000px;margin:0 auto}
+.cb-center{text-align:center}
+.cb-lead{font-size:17px;color:#6b7280;max-width:620px;margin:12px auto 0;line-height:1.6}
+.cb-btn{display:inline-block;padding:13px 26px;background:var(--site);color:#fff;border-radius:8px;font-weight:700;text-decoration:none;margin-top:24px}
+.cb-btn:hover{background:var(--siteh)}
+.cb-btn.ghost{background:transparent;color:var(--site);border:2px solid var(--site);margin-left:10px}
 
-  .wrap {
-    max-width: 680px;
-    margin: 0 auto;
-    padding: 0 24px;
-  }
+.steps-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden;margin-top:32px}
+.step{padding:36px;border-right:1px solid #e5e7eb;background:#fff}
+.step:last-child{border-right:none}
+.step-num{width:40px;height:40px;border-radius:50%;background:var(--site);color:#fff;font-size:16px;font-weight:800;display:flex;align-items:center;justify-content:center;margin-bottom:16px}
+.step h3{font-size:16px;font-weight:700;color:#111827;margin-bottom:8px}
+.step p{font-size:13px;color:#6b7280;line-height:1.7}
 
-  nav {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 28px 0;
-    border-bottom: 1px solid var(--rule);
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 500;
-    font-size: 1.05rem;
-  }
-  .dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--orange);
-    animation: dotshift 3.5s ease-in-out 1 forwards;
-  }
-  @keyframes dotshift {
-    0%   { background: var(--orange); }
-    55%  { background: var(--orange); }
-    100% { background: var(--green); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .dot { animation: none; background: var(--green); }
-  }
-  nav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
-  nav a:hover, nav a:focus-visible { color: var(--text); }
+.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:32px}
+.feat-card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,0.04)}
+.feat-card h3{font-size:14px;font-weight:700;color:#111827;margin-bottom:6px}
+.feat-card p{font-size:13px;color:#6b7280;line-height:1.6}
+.feat-card.soon{opacity:0.6}
+.soon-tag{display:inline-block;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--site);background:var(--site-light);border-radius:99px;padding:2px 8px;margin-left:6px;vertical-align:middle}
 
-  header.hero {
-    padding: 64px 0 40px;
-  }
-  h1 {
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 700;
-    font-size: clamp(1.9rem, 5vw, 2.6rem);
-    line-height: 1.25;
-    margin: 0 0 18px;
-    max-width: 15ch;
-  }
-  .lede {
-    color: var(--muted);
-    font-size: 1.08rem;
-    max-width: 46ch;
-    margin: 0 0 40px;
-  }
+.signup-box{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:32px;max-width:560px;margin:32px auto 0;text-align:left}
+.signup-steps{counter-reset:step}
+.signup-step{position:relative;padding:0 0 24px 40px;counter-increment:step}
+.signup-step:last-child{padding-bottom:0}
+.signup-step::before{content:counter(step);position:absolute;left:0;top:0;width:26px;height:26px;border-radius:50%;background:var(--site);color:#fff;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center}
+.signup-step-title{font-size:15px;font-weight:700;color:#111827;margin-bottom:5px}
+.signup-step-body{font-size:13px;color:#6b7280;line-height:1.6}
+.signup-target{display:inline-block;margin-top:6px;padding:6px 12px;background:var(--site-light);border:1px solid var(--site-border);border-radius:6px;font-family:monospace;font-size:13px;color:var(--site);text-decoration:none;font-weight:700}
 
-  /* -- the literal tray menu, as the hero visual -- */
-  .traymenu {
-    background: var(--bg-raised);
-    border: 1px solid var(--rule);
-    border-radius: 8px;
-    padding: 10px 0;
-    max-width: 340px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.92rem;
-    box-shadow: 0 12px 40px rgba(0,0,0,0.35);
-  }
-  .traymenu .status {
-    padding: 6px 16px 10px;
-    color: var(--muted);
-    font-size: 0.8rem;
-  }
-  .traymenu .rule { border-top: 1px solid var(--rule); margin: 6px 0; }
-  .traymenu .row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 7px 16px;
-  }
-  .traymenu .row .ring {
-    width: 9px; height: 9px; border-radius: 50%;
-    border: 1.5px solid var(--muted);
-    flex-shrink: 0;
-  }
-  .traymenu .row.on .ring {
-    background: var(--green);
-    border-color: var(--green);
-  }
-  .traymenu .row.action { color: var(--muted); }
+.install-box{max-width:760px;margin:32px auto 0;text-align:left}
+.code-block{background:#0f172a;border-radius:12px;padding:20px;font-family:monospace;font-size:13px;line-height:1.8;color:rgba(255,255,255,0.85);overflow-x:auto;display:flex;gap:12px;align-items:center;justify-content:space-between}
+.code-block code{white-space:pre;color:#5eead4}
+.copy-btn{flex-shrink:0;background:rgba(255,255,255,0.1);color:#fff;border:1px solid rgba(255,255,255,0.2);border-radius:6px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+.copy-btn:hover{background:rgba(255,255,255,0.18)}
+.install-note{font-size:13px;color:#6b7280;margin-top:12px;line-height:1.6}
 
-  section { padding: 36px 0; }
-  section h2 {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 1.05rem;
-    font-weight: 500;
-    margin: 0 0 14px;
-  }
-  section p { max-width: 58ch; }
+.privacy{max-width:640px;margin:24px auto 0;font-size:14px;color:#6b7280;line-height:1.7}
 
-  .traits {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 24px;
-    padding: 8px 0 4px;
-  }
-  .traits div { padding-top: 14px; border-top: 1px solid var(--rule); }
-  .traits strong { display: block; font-size: 0.98rem; margin-bottom: 4px; }
-  .traits span { color: var(--muted); font-size: 0.92rem; }
+.cb-credit{text-align:center;font-size:13px;color:#9ca3af;margin-bottom:10px}
+.cb-credit a{color:inherit;font-weight:600}
 
-  .cta-row {
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-    margin: 28px 0 24px;
-  }
-  .btn {
-    display: inline-block;
-    padding: 11px 20px;
-    border-radius: 6px;
-    text-decoration: none;
-    font-size: 0.95rem;
-    font-weight: 500;
-  }
-  .btn-primary { background: var(--orange); color: #1C1A18; }
-  .btn-primary:hover, .btn-primary:focus-visible { background: #ffb640; }
-  .btn-secondary { border: 1px solid var(--rule); color: var(--text); }
-  .btn-secondary:hover, .btn-secondary:focus-visible { border-color: var(--muted); }
-
-  .codebox {
-    background: var(--bg-raised);
-    border: 1px solid var(--rule);
-    border-radius: 6px;
-    padding: 14px 16px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.88rem;
-    overflow-x: auto;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-  .codebox code { white-space: nowrap; color: var(--text); }
-  .copybtn {
-    flex-shrink: 0;
-    background: none;
-    border: 1px solid var(--rule);
-    color: var(--muted);
-    border-radius: 4px;
-    padding: 5px 10px;
-    font-size: 0.8rem;
-    font-family: 'IBM Plex Sans', sans-serif;
-    cursor: pointer;
-  }
-  .copybtn:hover { color: var(--text); border-color: var(--muted); }
-
-  footer {
-    border-top: 1px solid var(--rule);
-    padding: 28px 0 48px;
-    color: var(--muted);
-    font-size: 0.88rem;
-  }
-  footer a { color: var(--muted); }
-  footer a:hover, footer a:focus-visible { color: var(--text); }
-
-  :focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
-
-  @media (max-width: 560px) {
-    .traits { grid-template-columns: 1fr; gap: 16px; }
-  }
+@media(max-width:860px){
+    .steps-grid,.feat-grid{grid-template-columns:1fr}
+    .step{border-right:none;border-bottom:1px solid #e5e7eb}
+    .step:last-child{border-bottom:none}
+}
+@media(max-width:600px){
+    .tw-section,.tw-hero{padding-left:16px;padding-right:16px}
+    .cb-btn.ghost{margin-left:0}
+    .code-block{flex-direction:column;align-items:stretch}
+}
 </style>
 </head>
 <body>
 
-<div class="wrap">
-  <nav>
-    <div class="brand"><span class="dot" aria-hidden="true"></span>clickboard</div>
-    <a href="#install">Install</a>
-  </nav>
-
-  <header class="hero">
-    <h1>Click a machine.<br>Your clipboard follows.</h1>
-    <p class="lede">A tray app for two or more machines — Linux today, Windows support on the way. Nothing syncs until you click a name — then it flows both ways until you click it again. No SSH experience required: the built-in pairing flow sets the connection up for you.</p>
-
-    <div class="traymenu" role="img" aria-label="Tray menu showing A9-Max connected and geek-1 not connected, with a Configure option below">
-      <div class="status">Status: 1 connected</div>
-      <div class="rule"></div>
-      <div class="row on"><span class="ring"></span>A9-Max (192.168.1.181)</div>
-      <div class="row"><span class="ring"></span>geek-1 (192.168.1.101)</div>
-      <div class="rule"></div>
-      <div class="row action">Configure...</div>
+<nav class="tw-nav">
+    <a href="https://tiny-web.uk" class="tw-nav-logo">
+        <div class="tw-mark">
+            <svg viewBox="0 0 34 34" fill="none" xmlns="http://www.w3.org/2000/svg" width="34" height="34">
+                <line x1="8" y1="17" x2="26" y2="7" stroke="#5eead4" stroke-width="1.8" stroke-opacity="0.5" stroke-linecap="round"/>
+                <line x1="8" y1="17" x2="26" y2="27" stroke="#5eead4" stroke-width="1.8" stroke-opacity="0.5" stroke-linecap="round"/>
+                <line x1="26" y1="7" x2="26" y2="27" stroke="#5eead4" stroke-width="1.8" stroke-opacity="0.5" stroke-linecap="round"/>
+                <circle cx="8" cy="17" r="3.8" fill="none" stroke="#5eead4" stroke-width="1.8"/>
+                <circle cx="26" cy="7" r="3" fill="#5eead4" fill-opacity="0.85"/>
+                <circle cx="26" cy="27" r="3" fill="#5eead4" fill-opacity="0.85"/>
+            </svg>
+        </div>
+        <div>
+            <div class="tw-nav-brand" style="color:#fff">Click<span style="color:#5eead4">board</span></div>
+        </div>
+    </a>
+    <div class="tw-nav-links">
+        <a href="#how" class="tw-nav-link">How it works</a>
+        <a href="#features" class="tw-nav-link">Features</a>
+        <a href="#signup" class="tw-nav-link">Get your key</a>
+        <a href="#install" class="tw-nav-link tw-nav-btn">Install →</a>
     </div>
-  </header>
+</nav>
 
-  <section>
-    <h2>What it actually does</h2>
-    <p>Clickboard doesn't watch your clipboard in the background and it doesn't touch the cloud. Click a machine in the tray menu and it opens an SSH connection to it; while that's open, whatever you copy on either end shows up on the other. Click it again and it stops — nothing runs, nothing's listening, no surprise overwrite of a clipboard you didn't mean to share.</p>
-  </section>
-
-  <section>
-    <h2>Setup takes two steps</h2>
-    <p>Point it at a machine's hostname and user, then either run <span class="mono">ssh-copy-id</span> yourself or use the built-in pairing flow — generate a short code on both machines, and Clickboard exchanges SSH keys for you, with a fingerprint you confirm by eye before anything's trusted.</p>
-  </section>
-
-  <div class="traits">
-    <div>
-      <strong>No auto-sync</strong>
-      <span>Every transfer starts with a click. Disconnect and it's off.</span>
+<section class="tw-hero">
+    <div class="cb-wrap cb-center">
+        <h1>The clipboard that follows you between machines</h1>
+        <p class="cb-lead">Copy on your desktop, paste on your laptop. Sign in once on each machine and they find each other on your network. No pairing, no config files, nothing to click.</p>
+        <a href="#signup" class="cb-btn">Get your free key →</a>
+        <a href="#install" class="cb-btn ghost">Install</a>
     </div>
-    <div>
-      <strong>Plain SSH</strong>
-      <span>No account, no relay server holding your clipboard.</span>
-    </div>
-    <div>
-      <strong>Open source</strong>
-      <span>Read the code, self-host the pairing broker, or both.</span>
-    </div>
-  </div>
+</section>
 
-  <section id="install">
-    <h2>Install</h2>
-    <p>Ubuntu 24.04, tested. Sets up a virtual environment and a tray launcher — asks for <span class="mono">sudo</span> only for the two system packages it can't install any other way, and tells you before it does.</p>
-
-    <div class="codebox">
-      <code>cd ~/Downloads && mkdir -p clickboard && tar xzf clickboard-latest.tar.gz -C clickboard && bash clickboard/install.sh</code>
-      <button class="copybtn" onclick="copyInstall(this)">Copy</button>
+<section class="tw-section" id="how">
+    <div class="cb-wrap">
+        <h2 class="cb-center">How it works</h2>
+        <div class="steps-grid">
+            <div class="step">
+                <div class="step-num">1</div>
+                <h3>Get your key</h3>
+                <p>One email and one text message prove you're a real person. Your Tiny-Web key arrives by email a moment later.</p>
+            </div>
+            <div class="step">
+                <div class="step-num">2</div>
+                <h3>Install on each machine</h3>
+                <p>One command installs Clickboard and everything it needs. Paste your key when it asks.</p>
+            </div>
+            <div class="step">
+                <div class="step-num">3</div>
+                <h3>Copy. Paste. Done.</h3>
+                <p>Your machines find each other on your network and connect by themselves. Only machines signed in with your key can join.</p>
+            </div>
+        </div>
     </div>
+</section>
 
-    <div class="cta-row">
-      <a class="btn btn-primary" href="https://drive.google.com/uc?export=download&id=1dVVqly5LGdfXshmj2RINPUdzVNn-bGSi">Download source (.tar.gz)</a>
-      <a class="btn btn-secondary" href="https://github.com/wallisoft/clickboard">View source</a>
+<section class="tw-section" id="features">
+    <div class="cb-wrap">
+        <h2 class="cb-center">Features</h2>
+        <div class="feat-grid">
+            <div class="feat-card">
+                <h3>Finds your machines</h3>
+                <p>Machines signed in with the same key discover each other on your local network automatically.</p>
+            </div>
+            <div class="feat-card">
+                <h3>Yours alone</h3>
+                <p>Other people on the same Wi-Fi can't join. Every new machine is announced, with a one-click Remove.</p>
+            </div>
+            <div class="feat-card">
+                <h3>Encrypted end to end</h3>
+                <p>Clipboard contents travel directly between your machines over encrypted connections. They never touch our servers.</p>
+            </div>
+            <div class="feat-card">
+                <h3>Lives in your tray</h3>
+                <p>A small icon shows what's connected. Pause a machine with one click.</p>
+            </div>
+            <div class="feat-card soon">
+                <h3>Windows <span class="soon-tag">Soon</span></h3>
+                <p>Sync between Linux and Windows machines on the same network.</p>
+            </div>
+            <div class="feat-card soon">
+                <h3>Images, files and folders <span class="soon-tag">Soon</span></h3>
+                <p>Screenshot on one machine, paste into an editor on another. Then whole files and folders.</p>
+            </div>
+        </div>
     </div>
-  </section>
+</section>
 
-  <footer>
-    <p>Part of <a href="https://tiny-web.uk">TinyWeb</a>. Source available under a dual license — see the repository for terms.</p>
-  </footer>
-</div>
+<section class="tw-section" id="signup">
+    <div class="cb-wrap cb-center">
+        <h2>Get your free key</h2>
+        <p class="cb-lead">The same key works across every Tiny-Web service.</p>
+        <div class="signup-box">
+            <div class="signup-steps">
+                <div class="signup-step">
+                    <div class="signup-step-title">Email us your mobile number</div>
+                    <div class="signup-step-body">From the email address you want on your account, send your mobile number to:<br>
+                        <a class="signup-target" href="mailto:signup@tiny-web.uk?subject=Clickboard%20signup">signup@tiny-web.uk</a></div>
+                </div>
+                <div class="signup-step">
+                    <div class="signup-step-title">Text us your email address</div>
+                    <div class="signup-step-body">From that same mobile, text the email address you just used to:<br>
+                        <span class="signup-target">+44 7576 556717</span></div>
+                </div>
+                <div class="signup-step">
+                    <div class="signup-step-title">Your key arrives by email</div>
+                    <div class="signup-step-body">Keep it somewhere safe. Clickboard asks for it once on each machine.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="tw-section" id="install">
+    <div class="cb-wrap cb-center">
+        <h2>Install</h2>
+        <p class="cb-lead">Ubuntu 24.04 and similar. Download the package, then run the command below in a terminal.</p>
+        <a href="https://drive.google.com/uc?export=download&amp;id=1dVVqly5LGdfXshmj2RINPUdzVNn-bGSi" class="cb-btn">Download clickboard-latest.tar.gz</a>
+        <div class="install-box">
+            <div class="code-block">
+                <code id="install-cmd">cd ~/Downloads &amp;&amp; mkdir -p clickboard &amp;&amp; tar xzf clickboard-latest.tar.gz -C clickboard &amp;&amp; bash clickboard/install.sh</code>
+                <button class="copy-btn" id="copy-btn">Copy</button>
+            </div>
+            <p class="install-note">The installer asks for your password once, to add the clipboard and network tools it needs. Then run <strong>clickboard</strong>, or find it in your app launcher.</p>
+        </div>
+        <p class="privacy">Your key is used only to confirm which machines belong to you. We store each machine's name, its network address and its public key, and nothing you copy.</p>
+    </div>
+</section>
 
 <script>
-  function copyInstall(btn) {
-    navigator.clipboard.writeText('cd ~/Downloads && mkdir -p clickboard && tar xzf clickboard-latest.tar.gz -C clickboard && bash clickboard/install.sh').then(() => {
-      const original = btn.textContent;
-      btn.textContent = 'Copied';
-      setTimeout(() => { btn.textContent = original; }, 1500);
+document.getElementById('copy-btn').addEventListener('click', function () {
+    var btn = this;
+    var cmd = document.getElementById('install-cmd').textContent;
+    navigator.clipboard.writeText(cmd).then(function () {
+        btn.textContent = 'Copied!';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1800);
     });
-  }
+});
 </script>
 
-<footer style="margin-top:48px;padding:20px;text-align:center;font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb">
-  Built by <a href="https://github.com/wallisoft" style="color:inherit;font-weight:600">Wallisoft</a> with Claude
-  &middot; Hosted on <a href="https://tiny-host.uk" style="color:inherit;font-weight:600">tiny-host.uk</a>
+<footer class="tw-footer">
+    <div class="cb-credit">
+        Built by <a href="https://github.com/wallisoft">Wallisoft</a> with Claude
+        &middot; Hosted on <a href="https://tiny-host.uk">tiny-host.uk</a>
+    </div>
+    <div class="tw-footer-links">
+        <a href="https://tiny-web.uk">TinyWeb</a> ·
+        <a href="https://tiny-vps.uk">TinyVPS</a> ·
+        <a href="https://tiny-sms.uk">TinySMS</a> ·
+        <a href="https://tiny-rdp.uk">TinyRDP</a> ·
+        <a href="https://tiny-dns.uk">TinyDNS</a> ·
+        <a href="https://tiny-mail.uk">TinyMail</a> ·
+        <a href="https://tiny-host.uk">TinyHost</a>
+    </div>
+    <div>
+        <a href="https://tiny-web.uk/privacy.php">Privacy</a> ·
+        <a href="https://tiny-web.uk/terms.php">Terms</a> ·
+        <a href="mailto:hello@tiny-web.uk">Contact</a>
+    </div>
+    <div class="tw-footer-copy">
+        © 2026 Wallisoft · Eastbourne, East Sussex, England
+    </div>
 </footer>
 </body>
 </html>

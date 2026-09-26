@@ -30,7 +30,7 @@ PACKAGE_URL="${CLICKBOARD_PACKAGE_URL:-https://drive.google.com/uc?export=downlo
 PROJECT_DIR="$HOME/projects/clickboard"
 BIN_SHIM="$HOME/bin/clickboard"
 SOURCE_FILES=(clickboard.py requirements.txt clickboard.desktop)
-REQUIRED_PKGS=(python3-venv python3-gi gir1.2-ayatanaappindicator3-0.1 gir1.2-gtk-3.0 openssh-server avahi-utils xclip wl-clipboard)
+REQUIRED_PKGS=(python3-venv python3-gi gir1.2-ayatanaappindicator3-0.1 gir1.2-gtk-3.0 python3-tk xclip wl-clipboard libnotify-bin)
 
 if [ "$(id -u)" -eq 0 ]; then
     echo "Don't run this whole script as root." >&2
@@ -109,14 +109,18 @@ else
     echo "==> System packages OK"
 fi
 
-# --- SSH service ------------------------------------------------------------
+# --- Firewall ---------------------------------------------------------------
+# Clickboard machines talk to each other directly on TCP 47800 (TLS).
 echo ""
-if systemctl is-enabled --quiet ssh 2>/dev/null && systemctl is-active --quiet ssh 2>/dev/null; then
-    echo "==> SSH service already enabled and running"
+if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "==> Need sudo now: allowing Clickboard (TCP 47800) through the firewall"
+    sudo ufw allow 47800/tcp comment 'Clickboard' >/dev/null
 else
-    echo "==> Need sudo now: making sure the SSH service is enabled"
-    sudo systemctl enable --now ssh
+    echo "==> Firewall not active, nothing to open"
 fi
+
+# Stop any running copy so the new version starts cleanly
+pkill -f "$PROJECT_DIR/clickboard.py" 2>/dev/null || true
 
 # --- Python venv ------------------------------------------------------------
 echo ""
@@ -136,6 +140,10 @@ chmod +x "$BIN_SHIM"
 echo "==> Installing the app-menu launcher"
 mkdir -p "$HOME/.local/share/applications"
 sed "s|Exec=.*|Exec=$BIN_SHIM|" "$PROJECT_DIR/clickboard.desktop" > "$HOME/.local/share/applications/clickboard.desktop"
+
+echo "==> Starting Clickboard automatically when you log in"
+mkdir -p "$HOME/.config/autostart"
+cp "$HOME/.local/share/applications/clickboard.desktop" "$HOME/.config/autostart/"
 
 echo ""
 echo "Done. Run 'clickboard' (make sure ~/bin is on your PATH), or find it in your app launcher."
