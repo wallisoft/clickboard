@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=clickboard
+Comment=On-demand clipboard pull/push over SSH
+Exec=/home/steve/bin/clickboard
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
