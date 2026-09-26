@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>clickboard — clipboard, on click</title>
+<meta name="description" content="A tiny tray app that moves your clipboard between two machines over SSH, only when you tell it to.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1C1A18;
+    --bg-raised: #23201D;
+    --text: #EDE9E3;
+    --muted: #8A8580;
+    --orange: #F5A623;
+    --green: #3ECF8E;
+    --rule: #38342F;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    line-height: 1.55;
+  }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  .wrap {
+    max-width: 680px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 28px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 500;
+    font-size: 1.05rem;
+  }
+  .dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--orange);
+    animation: dotshift 3.5s ease-in-out 1 forwards;
+  }
+  @keyframes dotshift {
+    0%   { background: var(--orange); }
+    55%  { background: var(--orange); }
+    100% { background: var(--green); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot { animation: none; background: var(--green); }
+  }
+  nav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
+  nav a:hover, nav a:focus-visible { color: var(--text); }
+
+  header.hero {
+    padding: 64px 0 40px;
+  }
+  h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: clamp(1.9rem, 5vw, 2.6rem);
+    line-height: 1.25;
+    margin: 0 0 18px;
+    max-width: 15ch;
+  }
+  .lede {
+    color: var(--muted);
+    font-size: 1.08rem;
+    max-width: 46ch;
+    margin: 0 0 40px;
+  }
+
+  /* -- the literal tray menu, as the hero visual -- */
+  .traymenu {
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 10px 0;
+    max-width: 340px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.92rem;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.35);
+  }
+  .traymenu .status {
+    padding: 6px 16px 10px;
+    color: var(--muted);
+    font-size: 0.8rem;
+  }
+  .traymenu .rule { border-top: 1px solid var(--rule); margin: 6px 0; }
+  .traymenu .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 16px;
+  }
+  .traymenu .row .ring {
+    width: 9px; height: 9px; border-radius: 50%;
+    border: 1.5px solid var(--muted);
+    flex-shrink: 0;
+  }
+  .traymenu .row.on .ring {
+    background: var(--green);
+    border-color: var(--green);
+  }
+  .traymenu .row.action { color: var(--muted); }
+
+  section { padding: 36px 0; }
+  section h2 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.05rem;
+    font-weight: 500;
+    margin: 0 0 14px;
+  }
+  section p { max-width: 58ch; }
+
+  .traits {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+    padding: 8px 0 4px;
+  }
+  .traits div { padding-top: 14px; border-top: 1px solid var(--rule); }
+  .traits strong { display: block; font-size: 0.98rem; margin-bottom: 4px; }
+  .traits span { color: var(--muted); font-size: 0.92rem; }
+
+  .cta-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin: 28px 0 24px;
+  }
+  .btn {
+    display: inline-block;
+    padding: 11px 20px;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 0.95rem;
+    font-weight: 500;
+  }
+  .btn-primary { background: var(--orange); color: #1C1A18; }
+  .btn-primary:hover, .btn-primary:focus-visible { background: #ffb640; }
+  .btn-secondary { border: 1px solid var(--rule); color: var(--text); }
+  .btn-secondary:hover, .btn-secondary:focus-visible { border-color: var(--muted); }
+
+  .codebox {
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88rem;
+    overflow-x: auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .codebox code { white-space: nowrap; color: var(--text); }
+  .copybtn {
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 0.8rem;
+    font-family: 'IBM Plex Sans', sans-serif;
+    cursor: pointer;
+  }
+  .copybtn:hover { color: var(--text); border-color: var(--muted); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding: 28px 0 48px;
+    color: var(--muted);
+    font-size: 0.88rem;
+  }
+  footer a { color: var(--muted); }
+  footer a:hover, footer a:focus-visible { color: var(--text); }
+
+  :focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+
+  @media (max-width: 560px) {
+    .traits { grid-template-columns: 1fr; gap: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <div class="brand"><span class="dot" aria-hidden="true"></span>clickboard</div>
+    <a href="#install">Install</a>
+  </nav>
+
+  <header class="hero">
+    <h1>Click a machine.<br>Your clipboard follows.</h1>
+    <p class="lede">A tray app for two or more machines — Linux today, Windows support on the way. Nothing syncs until you click a name — then it flows both ways until you click it again. No SSH experience required: the built-in pairing flow sets the connection up for you.</p>
+
+    <div class="traymenu" role="img" aria-label="Tray menu showing A9-Max connected and geek-1 not connected, with a Configure option below">
+      <div class="status">Status: 1 connected</div>
+      <div class="rule"></div>
+      <div class="row on"><span class="ring"></span>A9-Max (192.168.1.181)</div>
+      <div class="row"><span class="ring"></span>geek-1 (192.168.1.101)</div>
+      <div class="rule"></div>
+      <div class="row action">Configure...</div>
+    </div>
+  </header>
+
+  <section>
+    <h2>What it actually does</h2>
+    <p>Clickboard doesn't watch your clipboard in the background and it doesn't touch the cloud. Click a machine in the tray menu and it opens an SSH connection to it; while that's open, whatever you copy on either end shows up on the other. Click it again and it stops — nothing runs, nothing's listening, no surprise overwrite of a clipboard you didn't mean to share.</p>
+  </section>
+
+  <section>
+    <h2>Setup takes two steps</h2>
+    <p>Point it at a machine's hostname and user, then either run <span class="mono">ssh-copy-id</span> yourself or use the built-in pairing flow — generate a short code on both machines, and Clickboard exchanges SSH keys for you, with a fingerprint you confirm by eye before anything's trusted.</p>
+  </section>
+
+  <div class="traits">
+    <div>
+      <strong>No auto-sync</strong>
+      <span>Every transfer starts with a click. Disconnect and it's off.</span>
+    </div>
+    <div>
+      <strong>Plain SSH</strong>
+      <span>No account, no relay server holding your clipboard.</span>
+    </div>
+    <div>
+      <strong>Open source</strong>
+      <span>Read the code, self-host the pairing broker, or both.</span>
+    </div>
+  </div>
+
+  <section id="install">
+    <h2>Install</h2>
+    <p>Ubuntu 24.04, tested. Sets up a virtual environment and a tray launcher — asks for <span class="mono">sudo</span> only for the two system packages it can't install any other way, and tells you before it does.</p>
+
+    <div class="codebox">
+      <code>cd ~/Downloads && mkdir -p clickboard && tar xzf clickboard-latest.tar.gz -C clickboard && bash clickboard/install.sh</code>
+      <button class="copybtn" onclick="copyInstall(this)">Copy</button>
+    </div>
+
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://drive.google.com/uc?export=download&id=1dVVqly5LGdfXshmj2RINPUdzVNn-bGSi">Download source (.tar.gz)</a>
+      <a class="btn btn-secondary" href="https://github.com/wallisoft/clickboard">View source</a>
+    </div>
+  </section>
+
+  <footer>
+    <p>Part of <a href="https://tiny-web.uk">TinyWeb</a>. Source available under a dual license — see the repository for terms.</p>
+  </footer>
+</div>
+
+<script>
+  function copyInstall(btn) {
+    navigator.clipboard.writeText('cd ~/Downloads && mkdir -p clickboard && tar xzf clickboard-latest.tar.gz -C clickboard && bash clickboard/install.sh').then(() => {
+      const original = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = original; }, 1500);
+    });
+  }
+</script>
+
+<footer style="margin-top:48px;padding:20px;text-align:center;font-size:13px;color:#6b7280;border-top:1px solid #e5e7eb">
+  Built by <a href="https://github.com/wallisoft" style="color:inherit;font-weight:600">Wallisoft</a> with Claude
+  &middot; Hosted on <a href="https://tiny-host.uk" style="color:inherit;font-weight:600">tiny-host.uk</a>
+</footer>
+</body>
+</html>
