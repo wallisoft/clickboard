@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 import webbrowser
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 import pyperclip
 import pystray
@@ -36,7 +37,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 SIGNUP_EMAIL = "signup@tiny-web.uk"        # fallbacks if signup-info.php is unreachable
@@ -47,7 +48,10 @@ REGISTER_EVERY = 60       # seconds between check-ins with Tiny-Web
 DIAL_EVERY = 5            # seconds between attempts to reach unconnected machines
 POLL_EVERY = 0.4          # seconds between local clipboard checks
 PING_EVERY = 20           # keepalive; a link silent for 3x this is dropped
-MAX_CLIP_BYTES = 10 * 1024 * 1024
+MAX_CLIP_BYTES = 32 * 1024 * 1024       # largest single frame (text or image)
+CHUNK_BYTES = 1024 * 1024               # file transfer chunk size
+FILES_MAX_TOTAL = 2 * 1024 ** 3         # don't send more than this per copy
+RECEIVED_DIR = Path.home() / "Clickboard" / "Received"
 
 if platform.system() == "Windows":
     CONFIG_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "Clickboard"
@@ -191,6 +195,178 @@ def api_post(endpoint: str, api_key: str, payload: dict, timeout=10) -> dict:
         return {"ok": False, "error": f"Can't reach Tiny-Web: {exc}"}
 
 
+# -- Clipboard backends --------------------------------------------------------
+
+class Clip:
+    """What's on the clipboard: kind is 'text', 'image' (PNG bytes) or 'files' (paths)."""
+
+    def __init__(self, kind, text=None, png=None, paths=None):
+        self.kind, self.text, self.png, self.paths = kind, text, png, paths or []
+
+    @property
+    def sig(self):
+        if self.kind == "text":
+            return ("text", hashlib.sha1(self.text.encode("utf-8", "replace")).hexdigest())
+        if self.kind == "image":
+            return ("image", hashlib.sha1(self.png).hexdigest())
+        return ("files", tuple(self.paths))
+
+
+class LinuxBackend:
+    """xclip where there's an X display (including XWayland), wl-clipboard otherwise."""
+
+    def __init__(self):
+        self.use_x = bool(os.environ.get("DISPLAY")) and shutil.which("xclip")
+        self.use_wl = not self.use_x and bool(os.environ.get("WAYLAND_DISPLAY")) and shutil.which("wl-paste")
+        desk = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+        self.gnome_files = any(d in desk for d in ("GNOME", "UNITY", "BUDGIE", "PANTHEON", "CINNAMON"))
+        self._last_token = None
+        if not (self.use_x or self.use_wl):
+            log("no clipboard tool found (install xclip or wl-clipboard)")
+
+    def _get(self, target=None, timeout=3):
+        if self.use_x:
+            cmd = ["xclip", "-selection", "clipboard", "-o"] + (["-t", target] if target else [])
+        elif self.use_wl:
+            cmd = ["wl-paste", "--no-newline"] + (["--type", target] if target else [])
+        else:
+            return None
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+            return r.stdout if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _put(self, data: bytes, target=None):
+        if self.use_x:
+            cmd = ["xclip", "-selection", "clipboard", "-i"] + (["-t", target] if target else [])
+        elif self.use_wl:
+            cmd = ["wl-copy"] + (["--type", target] if target else [])
+        else:
+            return
+        # xclip/wl-copy stay running to serve the clipboard, so never capture their output.
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p.stdin.write(data)
+        p.stdin.close()
+
+    def targets(self):
+        if self.use_x:
+            raw = self._get("TARGETS")
+        elif self.use_wl:
+            try:
+                r = subprocess.run(["wl-paste", "--list-types"], capture_output=True, timeout=3)
+                raw = r.stdout if r.returncode == 0 else None
+            except Exception:
+                raw = None
+        else:
+            raw = None
+        return set(raw.decode(errors="ignore").split()) if raw else set()
+
+    def read_if_changed(self):
+        """Return a Clip if the clipboard may have changed since last time, else None."""
+        t = self.targets()
+        if not t:
+            return None
+        token = None
+        if self.use_x and "TIMESTAMP" in t:
+            ts = self._get("TIMESTAMP")
+            token = ("ts", ts)
+        if token is None:
+            token = ("targets", tuple(sorted(t)))
+        if token[0] == "ts" and token == self._last_token:
+            return None
+        changed_token = token != self._last_token
+        self._last_token = token
+
+        if "x-special/gnome-copied-files" in t or "text/uri-list" in t:
+            raw = self._get("x-special/gnome-copied-files") if "x-special/gnome-copied-files" in t else None
+            lines = raw.decode(errors="ignore").splitlines()[1:] if raw else []
+            if not lines and "text/uri-list" in t:
+                raw = self._get("text/uri-list")
+                lines = raw.decode(errors="ignore").splitlines() if raw else []
+            paths = []
+            for line in lines:
+                line = line.strip()
+                if line.startswith("file://"):
+                    path = unquote(urlparse(line).path)
+                    if os.path.exists(path):
+                        paths.append(path)
+            if paths:
+                return Clip("files", paths=paths)
+        if "image/png" in t:
+            # Without a change timestamp, only re-read a (possibly large) image when the offer changed.
+            if token[0] == "targets" and not changed_token:
+                return None
+            png = self._get("image/png", timeout=10)
+            if png:
+                return Clip("image", png=png)
+        for target in ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain", None):
+            if target is None or target in t:
+                raw = self._get(target)
+                if raw is not None:
+                    return Clip("text", text=raw.decode("utf-8", errors="replace"))
+        return None
+
+    def write_text(self, text: str):
+        self._put(text.encode("utf-8"))
+
+    def write_image(self, png: bytes):
+        self._put(png, "image/png")
+
+    def write_files(self, paths):
+        uris = [f"file://{quote(str(p))}" for p in paths]
+        if self.gnome_files:
+            self._put(("copy\n" + "\n".join(uris)).encode(), "x-special/gnome-copied-files")
+        else:
+            self._put(("\r\n".join(uris) + "\r\n").encode(), "text/uri-list")
+
+
+class TextOnlyBackend:
+    """Fallback anywhere else (until the Windows backend lands): plain text via pyperclip."""
+
+    def __init__(self):
+        self._last = None
+
+    def read_if_changed(self):
+        try:
+            text = pyperclip.paste()
+        except Exception:
+            return None
+        if text == self._last:
+            return None
+        self._last = text
+        return Clip("text", text=text)
+
+    def write_text(self, text):
+        self._last = text
+        pyperclip.copy(text)
+
+    def write_image(self, png):
+        pass
+
+    def write_files(self, paths):
+        pass
+
+
+def make_backend():
+    return LinuxBackend() if platform.system() == "Linux" else TextOnlyBackend()
+
+
+def human_size(n: int) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def safe_rel(path: str):
+    """A received relative path, or None if it tries to escape the destination."""
+    parts = [p for p in Path(path.replace("\\", "/")).parts if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts) or Path(path).is_absolute():
+        return None
+    return Path(*parts)
+
+
 def signup_info() -> dict:
     """Signup email + SMS number from Tiny-Web (load-balanced there), with fallbacks."""
     info = {"email": SIGNUP_EMAIL, "sms_number": SIGNUP_SMS_FALLBACK}
@@ -239,6 +415,7 @@ class Link:
         self.peer_id = peer_id
         self.initiator = initiator
         self.alive = True
+        self.rx = {}   # incoming file transfers by id
         self._send_lock = threading.Lock()
 
     def send(self, header: dict, payload: bytes = b""):
@@ -255,8 +432,11 @@ class Link:
         try:
             while self.alive:
                 header, payload = recv_frame(self.sock)
-                if header.get("type") == "clip":
+                kind = header.get("type")
+                if kind == "clip":
                     self.app.on_remote_clip(self.peer_id, header, payload)
+                elif kind in ("files_begin", "dir", "file_chunk", "files_end"):
+                    self.app.on_remote_files(self, header, payload)
         except Exception as exc:
             self.close(str(exc))
 
@@ -285,7 +465,8 @@ class App:
         self.plan = None
         self.status = ""
         self.warn = False
-        self.last_clip = None
+        self.backend = make_backend()
+        self.last_sig = None
         self.clip_lock = threading.Lock()
         self.wake = threading.Event()
         self._last_wake = 0.0
@@ -443,49 +624,175 @@ class App:
                 link.send({"type": "ping"})
 
     # ---- clipboard ----
+    def features(self):
+        return (self.plan or {}).get("features", {}) or {}
+
     def watch_clipboard(self):
-        warned = False
-        try:
-            self.last_clip = pyperclip.paste()   # don't broadcast whatever was there at startup
-        except Exception:
-            pass
+        first = self.backend.read_if_changed()      # don't send whatever was there at startup
+        if first:
+            self.last_sig = first.sig
         while self.running:
             try:
-                text = pyperclip.paste()
-                warned = False
+                clip = self.backend.read_if_changed()
             except Exception as exc:
-                if not warned:
-                    log(f"can't read the clipboard: {exc}")
-                    warned = True
-                text = None
-            if text is not None:
+                log(f"clipboard read failed: {exc}")
+                clip = None
+            if clip:
                 with self.clip_lock:
-                    changed = text != self.last_clip
+                    changed = clip.sig != self.last_sig
                     if changed:
-                        self.last_clip = text
-                if changed and text and not self.cfg.paused:
-                    self.broadcast_text(text)
+                        self.last_sig = clip.sig
+                if changed and not self.cfg.paused and self.links:
+                    self.broadcast(clip)
             time.sleep(POLL_EVERY)
 
-    def broadcast_text(self, text: str):
-        data = text.encode("utf-8")
-        if len(data) > MAX_CLIP_BYTES:
-            log("clipboard too large to send")
-            return
-        for link in list(self.links.values()):
-            link.send({"type": "clip", "mime": "text/plain;charset=utf-8"}, data)
+    def broadcast(self, clip: Clip):
+        links = [link for link in self.links.values() if link.alive]
+        if clip.kind == "text":
+            if not clip.text:
+                return
+            data = clip.text.encode("utf-8")
+            if len(data) > MAX_CLIP_BYTES:
+                log("text too large to send")
+                return
+            for link in links:
+                link.send({"type": "clip", "mime": "text/plain;charset=utf-8"}, data)
+        elif clip.kind == "image":
+            if self.features().get("images") is False:
+                return
+            if len(clip.png) > MAX_CLIP_BYTES:
+                self.notify("That image is too large to send.")
+                return
+            for link in links:
+                link.send({"type": "clip", "mime": "image/png"}, clip.png)
+        elif clip.kind == "files":
+            if self.features().get("files") is False:
+                self.notify("Sending files needs a paid plan.")
+                return
+            total = 0
+            for p in clip.paths:
+                if os.path.isdir(p):
+                    for root, _, files in os.walk(p):
+                        for f in files:
+                            try:
+                                total += os.path.getsize(os.path.join(root, f))
+                            except OSError:
+                                pass
+                else:
+                    try:
+                        total += os.path.getsize(p)
+                    except OSError:
+                        pass
+            if total > FILES_MAX_TOTAL:
+                self.notify(f"Not sending {human_size(total)}: that's over the {human_size(FILES_MAX_TOTAL)} limit.")
+                return
+            for link in links:
+                threading.Thread(target=self._send_files, args=(link, clip.paths, total), daemon=True).start()
+
+    def _send_files(self, link, paths, total):
+        fid = str(uuid.uuid4())
+        link.send({"type": "files_begin", "id": fid, "items": [os.path.basename(p.rstrip("/")) for p in paths],
+                   "total": total})
+
+        def send_file(full, rel):
+            offset = 0
+            try:
+                with open(full, "rb") as fh:
+                    while link.alive:
+                        chunk = fh.read(CHUNK_BYTES)
+                        eof = len(chunk) < CHUNK_BYTES
+                        link.send({"type": "file_chunk", "id": fid, "path": rel, "offset": offset, "eof": eof}, chunk)
+                        offset += len(chunk)
+                        if eof:
+                            break
+            except OSError as exc:
+                log(f"skipped {full}: {exc}")
+
+        for p in paths:
+            p = p.rstrip("/")
+            base = os.path.dirname(p)
+            if os.path.isdir(p):
+                for root, dirs, files in os.walk(p):
+                    rel_root = os.path.relpath(root, base)
+                    link.send({"type": "dir", "id": fid, "path": rel_root})
+                    for f in files:
+                        send_file(os.path.join(root, f), os.path.join(rel_root, f))
+            elif os.path.isfile(p):
+                send_file(p, os.path.basename(p))
+        link.send({"type": "files_end", "id": fid})
+        name = self.peers.get(link.peer_id, {}).get("name", "another machine")
+        log(f"sent {len(paths)} item(s), {human_size(total)}, to {name}")
 
     def on_remote_clip(self, peer_id, header, payload):
         if self.cfg.paused:
             return
-        if str(header.get("mime", "")).startswith("text/plain"):
-            text = payload.decode("utf-8", errors="replace")
+        mime = str(header.get("mime", ""))
+        try:
+            if mime.startswith("text/plain"):
+                clip = Clip("text", text=payload.decode("utf-8", errors="replace"))
+                with self.clip_lock:
+                    self.last_sig = clip.sig    # so the watcher doesn't bounce it straight back
+                    self.backend.write_text(clip.text)
+            elif mime == "image/png":
+                clip = Clip("image", png=payload)
+                with self.clip_lock:
+                    self.last_sig = clip.sig
+                    self.backend.write_image(payload)
+        except Exception as exc:
+            log(f"can't write the clipboard: {exc}")
+
+    def on_remote_files(self, link, header, payload):
+        kind, fid = header.get("type"), str(header.get("id", ""))
+        if kind == "files_begin":
+            if self.cfg.paused:
+                return
+            dest = RECEIVED_DIR / time.strftime("%Y-%m-%d %H%M%S")
+            n = 1
+            while dest.exists():
+                n += 1
+                dest = RECEIVED_DIR / (time.strftime("%Y-%m-%d %H%M%S") + f" ({n})")
+            dest.mkdir(parents=True, exist_ok=True)
+            items = [i for i in (header.get("items") or []) if safe_rel(str(i))]
+            link.rx[fid] = {"dest": dest, "items": items, "total": int(header.get("total", 0)), "open": {}}
+            return
+        rx = link.rx.get(fid)
+        if not rx:
+            return
+        if kind == "dir":
+            rel = safe_rel(str(header.get("path", "")))
+            if rel:
+                (rx["dest"] / rel).mkdir(parents=True, exist_ok=True)
+        elif kind == "file_chunk":
+            rel = safe_rel(str(header.get("path", "")))
+            if not rel:
+                return
+            target = rx["dest"] / rel
+            fh = rx["open"].get(rel)
+            if fh is None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fh = open(target, "wb")
+                rx["open"][rel] = fh
+            fh.write(payload)
+            if header.get("eof"):
+                fh.close()
+                del rx["open"][rel]
+        elif kind == "files_end":
+            for fh in rx["open"].values():
+                fh.close()
+            del link.rx[fid]
+            paths = [str(rx["dest"] / i) for i in rx["items"] if (rx["dest"] / i).exists()]
+            if not paths:
+                return
+            clip = Clip("files", paths=paths)
             with self.clip_lock:
-                self.last_clip = text   # so the watcher doesn't bounce it straight back
+                self.last_sig = clip.sig
                 try:
-                    pyperclip.copy(text)
+                    self.backend.write_files(paths)
                 except Exception as exc:
-                    log(f"can't write the clipboard: {exc}")
+                    log(f"can't put received files on the clipboard: {exc}")
+            name = self.peers.get(link.peer_id, {}).get("name", "another machine")
+            self.notify(f"Received {len(paths)} item(s), {human_size(rx['total'])}, from {name}. "
+                        f"Paste in your file manager, or find them in {rx['dest']}")
 
     # ---- UI plumbing ----
     def set_status(self, text, warn=False):
