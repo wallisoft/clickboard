@@ -36,10 +36,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 DEFAULT_PORT = 47800
+CONTROL_PORT = 47801      # localhost only: lets the launcher talk to a running copy
 REGISTER_EVERY = 60       # seconds between check-ins with Tiny-Web
 DIAL_EVERY = 5            # seconds between attempts to reach unconnected machines
 POLL_EVERY = 0.4          # seconds between local clipboard checks
@@ -54,9 +55,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CERT_FILE = CONFIG_DIR / "cert.pem"
 KEY_FILE = CONFIG_DIR / "key.pem"
 
-COLOUR_OK = (13, 148, 136, 255)       # teal: at least one machine connected
-COLOUR_IDLE = (140, 140, 140, 255)    # grey: nothing connected yet
-COLOUR_WARN = (217, 119, 6, 255)      # amber: needs attention (no key, error)
+COLOUR_OK = (34, 197, 94, 255)        # green: syncing with at least one machine
+COLOUR_OFF = (249, 115, 22, 255)      # orange: not connected (or needs attention)
+COLOUR_PAUSED = (156, 163, 175, 255)  # grey: paused by you
 
 
 def log(msg):
@@ -502,7 +503,12 @@ class App:
     def refresh_ui(self):
         if not self.icon:
             return
-        colour = COLOUR_WARN if self.warn else (COLOUR_OK if self.connected_count() and not self.cfg.paused else COLOUR_IDLE)
+        if self.cfg.paused:
+            colour = COLOUR_PAUSED
+        elif self.connected_count() and not self.warn:
+            colour = COLOUR_OK
+        else:
+            colour = COLOUR_OFF
         try:
             self.icon.icon = icon_image(colour)
             self.icon.title = f"Clickboard - {self.status_line()}"
@@ -511,7 +517,12 @@ class App:
             pass
 
     def build_menu(self):
-        items = [pystray.MenuItem(self.status_line(), None, enabled=False), pystray.Menu.SEPARATOR]
+        items = [
+            pystray.MenuItem(lambda item: "Resume sync" if self.cfg.paused else "Pause sync",
+                             self.toggle_pause, default=True),
+            pystray.MenuItem(self.status_line(), None, enabled=False),
+            pystray.Menu.SEPARATOR,
+        ]
         for p in sorted(self.peers.values(), key=lambda d: d["name"].lower()):
             link = self.links.get(p["device_id"])
             mark = "\u25cf " if (link and link.alive) else "\u25cb "
@@ -519,7 +530,6 @@ class App:
         if self.peers:
             items.append(pystray.Menu.SEPARATOR)
         items += [
-            pystray.MenuItem("Pause sync", self.toggle_pause, checked=lambda item: self.cfg.paused),
             pystray.MenuItem("Settings...", lambda: self.open_settings()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit),
@@ -527,9 +537,46 @@ class App:
         return items
 
     def toggle_pause(self):
-        self.cfg.paused = not self.cfg.paused
+        self.set_paused(not self.cfg.paused)
+
+    def set_paused(self, paused: bool):
+        self.cfg.paused = paused
         self.cfg.save()
+        log("sync paused" if paused else "sync resumed")
         self.refresh_ui()
+
+    # ---- control channel: "clickboard --toggle" etc. from the dock/launcher ----
+    def control_loop(self):
+        try:
+            cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            cs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            cs.bind(("127.0.0.1", CONTROL_PORT))
+            cs.listen(4)
+        except OSError as exc:
+            log(f"control channel unavailable: {exc}")
+            return
+        while self.running:
+            try:
+                conn, _ = cs.accept()
+            except OSError:
+                continue
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    cmd = conn.recv(64).decode(errors="ignore").strip()
+                    conn.sendall(b"ok\n")
+                except OSError:
+                    continue
+            if cmd == "toggle":
+                self.toggle_pause()
+            elif cmd == "pause":
+                self.set_paused(True)
+            elif cmd == "resume":
+                self.set_paused(False)
+            elif cmd == "settings":
+                self.open_settings()
+            elif cmd == "quit":
+                self.quit()
 
     def quit(self):
         self.running = False
@@ -553,9 +600,10 @@ class App:
             self._settings_open = False
 
     def run(self):
-        for target in (self.serve, self.register_loop, self.dial_loop, self.ping_loop, self.watch_clipboard):
+        for target in (self.serve, self.register_loop, self.dial_loop, self.ping_loop,
+                       self.watch_clipboard, self.control_loop):
             threading.Thread(target=target, daemon=True).start()
-        self.icon = pystray.Icon("clickboard", icon_image(COLOUR_IDLE), "Clickboard",
+        self.icon = pystray.Icon("clickboard", icon_image(COLOUR_PAUSED if self.cfg.paused else COLOUR_OFF), "Clickboard",
                                  menu=pystray.Menu(lambda: self.build_menu()))
         if not self.cfg.api_key:
             threading.Timer(1.0, self.open_settings).start()
@@ -563,12 +611,10 @@ class App:
 
 
 def icon_image(colour):
+    """A plain coloured dot: green syncing, orange not connected, grey paused."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((14, 10, 50, 58), radius=6, fill=colour)
-    d.rounded_rectangle((24, 4, 40, 16), radius=3, fill=(60, 60, 60, 255))
-    d.line((22, 30, 42, 30), fill=(255, 255, 255, 220), width=3)
-    d.line((22, 40, 36, 40), fill=(255, 255, 255, 220), width=3)
+    d.ellipse((8, 8, 56, 56), fill=colour, outline=(255, 255, 255, 200), width=3)
     return img
 
 
@@ -687,8 +733,31 @@ class SettingsWindow:
         self.root.after(1000, self.tick)
 
 
+def send_to_running(cmd: str) -> bool:
+    """If Clickboard is already running, pass it a command and return True."""
+    try:
+        with socket.create_connection(("127.0.0.1", CONTROL_PORT), timeout=1) as s:
+            s.sendall((cmd + "\n").encode())
+            return s.recv(8).startswith(b"ok")
+    except OSError:
+        return False
+
+
 def main():
-    App().run()
+    flags = {"--toggle": "toggle", "--pause": "pause", "--resume": "resume",
+             "--settings": "settings", "--quit": "quit"}
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    # Launching again while running (e.g. clicking it in the dock) opens Settings.
+    cmd = flags.get(arg, "settings")
+    if send_to_running(cmd):
+        return
+    if cmd == "quit":
+        return
+    app = App()
+    if cmd in ("pause", "resume"):
+        app.cfg.paused = cmd == "pause"
+        app.cfg.save()
+    app.run()
 
 
 if __name__ == "__main__":
