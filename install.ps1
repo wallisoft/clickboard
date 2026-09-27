@@ -27,19 +27,35 @@ function Find-Python {
     $python = Get-Command python -ErrorAction SilentlyContinue
     # Skip the Microsoft Store placeholder that only opens the Store.
     if ($python -and $python.Source -notlike "*WindowsApps*") { return @($python.Source) }
+    # A fresh per-user install, before this window's PATH knows about it.
+    foreach ($v in "313", "312", "311") {
+        $exe = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$v\python.exe"
+        if (Test-Path $exe) { return @($exe) }
+    }
     return $null
 }
 
 $Py = Find-Python
 if (-not $Py) {
     Write-Host "==> Python not found, installing Python 3.12 (one-off, takes a minute)"
-    winget install -e --id Python.Python.3.12 --scope user --silent `
-        --accept-package-agreements --accept-source-agreements
+    $wingetOk = $false
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        winget install -e --id Python.Python.3.12 --source winget --scope user --silent `
+            --accept-package-agreements --accept-source-agreements
+        $wingetOk = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $wingetOk) {
+        Write-Host "==> winget couldn't do it, downloading Python from python.org instead"
+        $pyInstaller = Join-Path $env:TEMP "python-3.12-installer.exe"
+        Invoke-WebRequest "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile $pyInstaller -UseBasicParsing
+        Start-Process $pyInstaller -Wait -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0"
+        Remove-Item $pyInstaller -Force -ErrorAction SilentlyContinue
+    }
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "User") + ";" +
                 [Environment]::GetEnvironmentVariable("Path", "Machine")
     $Py = Find-Python
     if (-not $Py) {
-        throw "Python installed, but this window can't see it yet. Close PowerShell, open a new one, and run the installer again."
+        throw "Couldn't install Python automatically. Install Python 3.12 from python.org (tick 'Add python.exe to PATH'), then run this installer again."
     }
 }
 Write-Host "==> Using $(& $Py[0] $Py[1..9] --version)"
