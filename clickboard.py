@@ -36,9 +36,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
+SIGNUP_EMAIL = "signup@tiny-web.uk"        # fallbacks if signup-info.php is unreachable
+SIGNUP_SMS_FALLBACK = "+447576556717"
 DEFAULT_PORT = 47800
 CONTROL_PORT = 47801      # localhost only: lets the launcher talk to a running copy
 REGISTER_EVERY = 60       # seconds between check-ins with Tiny-Web
@@ -57,7 +59,7 @@ KEY_FILE = CONFIG_DIR / "key.pem"
 
 COLOUR_OK = (34, 197, 94, 255)        # green: syncing with at least one machine
 COLOUR_OFF = (249, 115, 22, 255)      # orange: not connected (or needs attention)
-COLOUR_PAUSED = (156, 163, 175, 255)  # grey: paused by you
+COLOUR_PAUSED = (249, 115, 22, 255)   # orange too: paused by you (menu says which)
 
 
 def log(msg):
@@ -187,6 +189,22 @@ def api_post(endpoint: str, api_key: str, payload: dict, timeout=10) -> dict:
             return {"ok": False, "error": f"Tiny-Web returned HTTP {exc.code}"}
     except Exception as exc:
         return {"ok": False, "error": f"Can't reach Tiny-Web: {exc}"}
+
+
+def signup_info() -> dict:
+    """Signup email + SMS number from Tiny-Web (load-balanced there), with fallbacks."""
+    info = {"email": SIGNUP_EMAIL, "sms_number": SIGNUP_SMS_FALLBACK}
+    try:
+        req = urllib.request.Request(API_BASE + "signup-info.php",
+                                     headers={"User-Agent": f"Clickboard/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read())
+        if data.get("ok"):
+            info["email"] = data.get("email") or info["email"]
+            info["sms_number"] = data.get("sms_number") or info["sms_number"]
+    except Exception as exc:
+        log(f"signup info unavailable, using built-in details: {exc}")
+    return info
 
 
 # -- Wire protocol: [4-byte header length][JSON header][payload bytes] -------
@@ -652,7 +670,7 @@ class SettingsWindow:
         self.key_var = tk.StringVar(value=app.cfg.api_key)
         key_entry = ttk.Entry(outer, textvariable=self.key_var, width=48, show="\u2022")
         key_entry.grid(row=1, column=0, sticky="we", pady=(2, 0))
-        ttk.Button(outer, text="Get a free key", command=lambda: webbrowser.open(SIGNUP_URL)).grid(row=1, column=1, padx=(8, 0))
+        ttk.Button(outer, text="Get a free key", command=self.show_signup).grid(row=1, column=1, padx=(8, 0))
 
         ttk.Label(outer, text="This machine's name").grid(row=2, column=0, sticky="w", pady=(12, 0))
         self.name_var = tk.StringVar(value=app.cfg.name)
@@ -680,6 +698,56 @@ class SettingsWindow:
         if not app.cfg.api_key:
             root.after(150, key_entry.focus_set)
         root.mainloop()
+
+    def show_signup(self):
+        tk, ttk = self.tk, self.ttk
+        win = tk.Toplevel(self.root)
+        win.title("Get your free Tiny-Web key")
+        win.transient(self.root)
+        frame = ttk.Frame(win, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Three quick steps. One key works for all Tiny-Web services.",
+                  wraplength=440).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        email_var = tk.StringVar(value=SIGNUP_EMAIL)
+        sms_var = tk.StringVar(value="fetching...")
+
+        def copy(text):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+        def step(row, num, title, detail, var=None, button=None):
+            ttk.Label(frame, text=f"{num}.", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, sticky="nw", padx=(0, 8))
+            ttk.Label(frame, text=title, font=("TkDefaultFont", 10, "bold")).grid(row=row, column=1, sticky="w")
+            ttk.Label(frame, text=detail, wraplength=400, foreground="#555").grid(row=row + 1, column=1, sticky="w")
+            if var is not None:
+                box = ttk.Frame(frame)
+                box.grid(row=row + 2, column=1, sticky="w", pady=(4, 12))
+                ttk.Entry(box, textvariable=var, width=26, state="readonly", font=("monospace", 11)).pack(side="left")
+                ttk.Button(box, text="Copy", command=lambda: copy(var.get())).pack(side="left", padx=6)
+                if button:
+                    ttk.Button(box, text=button[0], command=button[1]).pack(side="left")
+            else:
+                ttk.Frame(frame, height=12).grid(row=row + 2, column=1)
+
+        step(1, 1, "Email us your mobile number",
+             "From the email address you want on your account, send your mobile number to:",
+             email_var, ("Open email", lambda: webbrowser.open(f"mailto:{email_var.get()}?subject=Clickboard%20signup")))
+        step(4, 2, "Text us your email address",
+             "From that same mobile, text the email address you just used to:", sms_var)
+        step(7, 3, "Your key arrives by email",
+             "Paste it into Clickboard's settings and click Save. That's it.")
+        ttk.Button(frame, text="I've got my key", command=win.destroy).grid(row=10, column=1, sticky="e", pady=(4, 0))
+
+        def load():
+            info = signup_info()
+            try:
+                self.root.after(0, lambda: (email_var.set(info["email"]), sms_var.set(info["sms_number"])))
+            except Exception:
+                pass
+        threading.Thread(target=load, daemon=True).start()
+        win.lift()
+        win.focus_force()
 
     def save(self):
         key = self.key_var.get().strip()
