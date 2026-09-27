@@ -1,8 +1,22 @@
 [Desktop Entry]
 Type=Application
-Name=clickboard
-Comment=On-demand clipboard pull/push over SSH
-Exec=/home/steve/bin/clickboard
+Name=Clickboard
+Comment=The clipboard that follows you between machines
+Exec=clickboard
 Icon=edit-paste
 Terminal=false
 Categories=Utility;
+StartupNotify=false
+Actions=Toggle;Settings;Quit;
+
+[Desktop Action Toggle]
+Name=Pause / resume sync
+Exec=clickboard --toggle
+
+[Desktop Action Settings]
+Name=Settings
+Exec=clickboard --settings
+
+[Desktop Action Quit]
+Name=Quit Clickboard
+Exec=clickboard --quit
