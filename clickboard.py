@@ -11,6 +11,8 @@ touch the server.
 """
 import datetime
 import hashlib
+import hmac
+import io
 import json
 import os
 import platform
@@ -37,13 +39,19 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 SIGNUP_EMAIL = "signup@tiny-web.uk"        # fallbacks if signup-info.php is unreachable
 SIGNUP_SMS_FALLBACK = "+447576556717"
 DEFAULT_PORT = 47800
 CONTROL_PORT = 47801      # localhost only: lets the launcher talk to a running copy
+BEACON_PORT = 47802       # UDP: local-mode machines announce themselves on the LAN
+BEACON_EVERY = 5          # seconds between local-mode announcements
+LOCAL_SEEN_FOR = 30       # a local machine not heard from in this long is offline
+MIN_PASSPHRASE = 8
+IMAGE_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp",
+               "image/bmp", "image/x-bmp", "image/tiff")
 REGISTER_EVERY = 60       # seconds between check-ins with Tiny-Web
 DIAL_EVERY = 5            # seconds between attempts to reach unconnected machines
 POLL_EVERY = 0.4          # seconds between local clipboard checks
@@ -73,10 +81,12 @@ def log(msg):
 # -- Config ------------------------------------------------------------------
 
 class Config:
-    FIELDS = ("api_key", "device_id", "name", "port", "paused")
+    FIELDS = ("mode", "api_key", "passphrase", "device_id", "name", "port", "paused")
 
     def __init__(self):
+        self.mode = "account"     # "account" (Tiny-Web key) or "local" (shared passphrase)
         self.api_key = ""
+        self.passphrase = ""
         self.device_id = str(uuid.uuid4())
         self.name = "".join(c for c in socket.gethostname().split(".")[0] if c.isalnum() or c in " .-_")[:64] or "machine"
         self.port = DEFAULT_PORT
@@ -221,6 +231,7 @@ class LinuxBackend:
         desk = os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
         self.gnome_files = any(d in desk for d in ("GNOME", "UNITY", "BUDGIE", "PANTHEON", "CINNAMON"))
         self._last_token = None
+        self._last_image_read = 0.0
         if not (self.use_x or self.use_wl):
             log("no clipboard tool found (install xclip or wl-clipboard)")
 
@@ -270,7 +281,8 @@ class LinuxBackend:
         token = None
         if self.use_x and "TIMESTAMP" in t:
             ts = self._get("TIMESTAMP")
-            token = ("ts", ts)
+            if ts:                      # some owners advertise TIMESTAMP but don't supply it
+                token = ("ts", ts)
         if token is None:
             token = ("targets", tuple(sorted(t)))
         if token[0] == "ts" and token == self._last_token:
@@ -293,11 +305,14 @@ class LinuxBackend:
                         paths.append(path)
             if paths:
                 return Clip("files", paths=paths)
-        if "image/png" in t:
-            # Without a change timestamp, only re-read a (possibly large) image when the offer changed.
-            if token[0] == "targets" and not changed_token:
+        img_type = next((x for x in IMAGE_TYPES if x in t), None)
+        if img_type:
+            # No usable change timestamp: re-read the image at most every 2 seconds.
+            if token[0] == "targets" and not changed_token and time.time() - self._last_image_read < 2:
                 return None
-            png = self._get("image/png", timeout=10)
+            self._last_image_read = time.time()
+            data = self._get(img_type, timeout=10)
+            png = to_png(data, img_type) if data else None
             if png:
                 return Clip("image", png=png)
         for target in ("UTF8_STRING", "text/plain;charset=utf-8", "text/plain", None):
@@ -346,6 +361,28 @@ class TextOnlyBackend:
 
     def write_files(self, paths):
         pass
+
+
+def to_png(data: bytes, mime: str):
+    """Other image formats are converted, so the receiving side always gets PNG."""
+    if mime == "image/png":
+        return data
+    try:
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        out = io.BytesIO()
+        img.save(out, "PNG")
+        return out.getvalue()
+    except Exception as exc:
+        log(f"couldn't convert {mime} image: {exc}")
+        return None
+
+
+def local_key(passphrase: str) -> bytes:
+    """Slow on purpose, so a captured announcement can't be cheaply brute-forced."""
+    return hashlib.scrypt(passphrase.encode("utf-8"), salt=b"clickboard-local-v1",
+                          n=2 ** 14, r=8, p=1, dklen=32)
 
 
 def make_backend():
@@ -472,7 +509,27 @@ class App:
         self._last_wake = 0.0
         self.icon = None
         self._settings_open = False
+        self._local_key = None
+        self._local_group = None
+        self._set_local_key()
         self._build_contexts()
+
+    def _set_local_key(self):
+        if self.cfg.mode == "local" and len(self.cfg.passphrase) >= MIN_PASSPHRASE:
+            self._local_key = local_key(self.cfg.passphrase)
+            self._local_group = hashlib.sha256(self._local_key + b"group").hexdigest()[:16]
+        else:
+            self._local_key = self._local_group = None
+
+    def reset_for_mode_change(self):
+        """Called after Settings switches between account and local mode, or changes key/passphrase."""
+        self._set_local_key()
+        for link in list(self.links.values()):
+            link.close("settings changed")
+        self.peers, self.peers_loaded, self.plan = {}, False, None
+        self._build_contexts()
+        self.set_status("")
+        self.wake.set()
 
     # TLS contexts: trust exactly the certificates registered to this account
     def _build_contexts(self):
@@ -501,7 +558,34 @@ class App:
             self._last_wake = time.time()
             self.wake.set()
 
+    def apply_peers(self, fresh: dict, announce: bool = True):
+        joined = [d for pid, d in fresh.items() if pid not in self.peers] if (self.peers_loaded and announce) else []
+        gone = [pid for pid in self.peers if pid not in fresh]
+        certs_changed = {p.get("cert_fp") for p in fresh.values()} != {p.get("cert_fp") for p in self.peers.values()}
+        self.peers = fresh
+        self.peers_loaded = True
+        if certs_changed:
+            self._build_contexts()
+        for pid in gone:
+            link = self.links.get(pid)
+            if link:
+                link.close("no longer in your group")
+        for d in joined:
+            if self.cfg.mode == "local":
+                self.notify(f"{d['name']} joined your Clickboard (local passphrase).")
+            else:
+                self.notify(f"{d['name']} joined your Clickboard. Not yours? Remove it in Settings.")
+        if joined or gone:
+            self.refresh_ui()
+
     def register_now(self):
+        if self.cfg.mode == "local":
+            if not self._local_key:
+                self.set_status(f"Set a passphrase of at least {MIN_PASSPHRASE} characters in Settings", warn=True)
+            else:
+                self.plan = {"name": "Local", "max_devices": None, "features": {"images": True, "files": True}}
+                self.set_status("")
+            return
         if not self.cfg.api_key:
             self.set_status("Add your Tiny-Web key in Settings", warn=True)
             return
@@ -516,22 +600,70 @@ class App:
         if not r.get("ok"):
             self.set_status(r.get("error", "Registration failed"), warn=True)
             return
+        if self.cfg.mode != "account":
+            return
         self.plan = r.get("plan")
-        fresh = {d["device_id"]: d for d in r.get("devices", [])}
-        joined = [d for pid, d in fresh.items() if pid not in self.peers] if self.peers_loaded else []
-        gone = [pid for pid in self.peers if pid not in fresh]
-        certs_changed = {p.get("cert_fp") for p in fresh.values()} != {p.get("cert_fp") for p in self.peers.values()}
-        self.peers = fresh
-        self.peers_loaded = True
-        if certs_changed:
-            self._build_contexts()
-        for pid in gone:
-            link = self.links.get(pid)
-            if link:
-                link.close("removed from account")
-        for d in joined:
-            self.notify(f"{d['name']} joined your Clickboard. Not yours? Remove it in Settings.")
+        self.apply_peers({d["device_id"]: d for d in r.get("devices", [])})
         self.set_status("")
+
+    # ---- local mode: LAN announcements signed with the shared passphrase ----
+    def _beacon_mac(self, device_id, port, fp):
+        return hmac.new(self._local_key, f"{device_id}|{port}|{fp}".encode(), hashlib.sha256).hexdigest()
+
+    def beacon_send_loop(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        fp = der_fingerprint(ssl.PEM_cert_to_DER_cert(self.cert_pem))
+        while self.running:
+            if self.cfg.mode == "local" and self._local_key:
+                msg = json.dumps({
+                    "v": 1, "group": self._local_group, "device_id": self.cfg.device_id,
+                    "name": self.cfg.name, "port": self.cfg.port, "cert_pem": self.cert_pem,
+                    "mac": self._beacon_mac(self.cfg.device_id, self.cfg.port, fp),
+                }).encode()
+                try:
+                    s.sendto(msg, ("255.255.255.255", BEACON_PORT))
+                except OSError:
+                    pass
+                self._expire_local_peers()
+            time.sleep(BEACON_EVERY)
+
+    def _expire_local_peers(self):
+        now = time.time()
+        fresh = {}
+        for pid, p in self.peers.items():
+            p = dict(p)
+            p["online"] = now - p.get("_seen", 0) < LOCAL_SEEN_FOR
+            fresh[pid] = p
+        self.peers = fresh
+
+    def beacon_listen_loop(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", BEACON_PORT))
+        except OSError as exc:
+            log(f"local discovery unavailable: {exc}")
+            return
+        while self.running:
+            try:
+                data, (addr, _) = s.recvfrom(8192)
+                if self.cfg.mode != "local" or not self._local_key:
+                    continue
+                b = json.loads(data)
+                if b.get("group") != self._local_group or b.get("device_id") == self.cfg.device_id:
+                    continue
+                pem, port, pid = b["cert_pem"], int(b["port"]), str(b["device_id"])
+                fp = der_fingerprint(ssl.PEM_cert_to_DER_cert(pem))
+                if not hmac.compare_digest(self._beacon_mac(pid, port, fp), str(b.get("mac", ""))):
+                    continue      # same group id but wrong passphrase proof: ignore
+            except Exception:
+                continue
+            fresh = dict(self.peers)
+            fresh[pid] = {"device_id": pid, "name": str(b.get("name", "machine"))[:64], "platform": "",
+                          "lan_addrs": [addr], "port": port, "cert_pem": pem, "cert_fp": fp,
+                          "online": True, "_seen": time.time()}
+            self.apply_peers(fresh)
 
     # ---- TLS server ----
     def serve(self):
@@ -926,11 +1058,12 @@ class App:
 
     def run(self):
         for target in (self.serve, self.register_loop, self.dial_loop, self.ping_loop,
-                       self.watch_clipboard, self.control_loop):
+                       self.watch_clipboard, self.control_loop,
+                       self.beacon_send_loop, self.beacon_listen_loop):
             threading.Thread(target=target, daemon=True).start()
         self.icon = pystray.Icon("clickboard", icon_image(COLOUR_PAUSED if self.cfg.paused else COLOUR_OFF), "Clickboard",
                                  menu=pystray.Menu(lambda: self.build_menu()))
-        if not self.cfg.api_key:
+        if not (self.cfg.api_key or (self.cfg.mode == "local" and self._local_key)):
             threading.Timer(1.0, self.open_settings).start()
         self.icon.run()
 
@@ -973,24 +1106,43 @@ class SettingsWindow:
         outer = ttk.Frame(root, padding=16)
         outer.pack(fill="both", expand=True)
 
-        ttk.Label(outer, text="Tiny-Web API key").grid(row=0, column=0, sticky="w")
-        self.key_var = tk.StringVar(value=app.cfg.api_key)
-        key_entry = ttk.Entry(outer, textvariable=self.key_var, width=48, show="\u2022")
-        key_entry.grid(row=1, column=0, sticky="we", pady=(2, 0))
-        ttk.Button(outer, text="Get a free key", command=self.show_signup).grid(row=1, column=1, padx=(8, 0))
+        self.mode_var = tk.StringVar(value=app.cfg.mode)
+        modes = ttk.Frame(outer)
+        modes.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(modes, text="Tiny-Web key (works on any network)", value="account",
+                        variable=self.mode_var, command=self.show_mode).pack(anchor="w")
+        ttk.Radiobutton(modes, text="Shared passphrase (no signup, same network)", value="local",
+                        variable=self.mode_var, command=self.show_mode).pack(anchor="w")
 
-        ttk.Label(outer, text="This machine's name").grid(row=2, column=0, sticky="w", pady=(12, 0))
+        self.key_label = ttk.Label(outer)
+        self.key_label.grid(row=0, column=0, sticky="w")
+        self.key_var = tk.StringVar(value=app.cfg.api_key)
+        self.pass_var = tk.StringVar(value=app.cfg.passphrase)
+        self.key_entry = ttk.Entry(outer, textvariable=self.key_var, width=48, show="\u2022")
+        self.pass_entry = ttk.Entry(outer, textvariable=self.pass_var, width=48)
+        self.key_btn = ttk.Button(outer, text="Get a free key", command=self.show_signup)
+        self.pass_btn = ttk.Button(outer, text="Generate", command=self.generate_passphrase)
+        key_entry = self.key_entry
+
+        # rows 1-2: mode radios are row 0; label/field/button are placed by show_mode()
+        modes.grid_configure(row=0)
+        self.key_label.grid_configure(row=1, pady=(10, 0))
+        self.show_mode()
+
+        ttk.Label(outer, text="This machine's name").grid(row=3, column=0, sticky="w", pady=(12, 0))
         self.name_var = tk.StringVar(value=app.cfg.name)
-        ttk.Entry(outer, textvariable=self.name_var, width=48).grid(row=3, column=0, sticky="we", pady=(2, 0))
-        ttk.Button(outer, text="Save", command=self.save).grid(row=3, column=1, padx=(8, 0))
+        ttk.Entry(outer, textvariable=self.name_var, width=48).grid(row=4, column=0, sticky="we", pady=(2, 0))
+        ttk.Button(outer, text="Save", command=self.save).grid(row=4, column=1, padx=(8, 0))
 
         self.status_var = tk.StringVar()
         ttk.Label(outer, textvariable=self.status_var, wraplength=460, foreground="#555").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.local_btn = ttk.Button(outer, text="Continue without an account",
+                                    command=lambda: (self.mode_var.set("local"), self.show_mode()))
 
-        ttk.Label(outer, text="Your machines", font=("TkDefaultFont", 10, "bold")).grid(row=5, column=0, sticky="w", pady=(16, 4))
+        ttk.Label(outer, text="Your machines", font=("TkDefaultFont", 10, "bold")).grid(row=7, column=0, sticky="w", pady=(16, 4))
         self.list_frame = ttk.Frame(outer)
-        self.list_frame.grid(row=6, column=0, columnspan=2, sticky="we")
+        self.list_frame.grid(row=8, column=0, columnspan=2, sticky="we")
         self._shown = None
 
         outer.columnconfigure(0, weight=1)
@@ -1002,9 +1154,31 @@ class SettingsWindow:
         root.attributes("-topmost", True)
         root.after(300, lambda: root.attributes("-topmost", False))
         root.after(100, root.focus_force)
-        if not app.cfg.api_key:
+        if not app.cfg.api_key and app.cfg.mode == "account":
             root.after(150, key_entry.focus_set)
         root.mainloop()
+
+    def show_mode(self):
+        local = self.mode_var.get() == "local"
+        for w in (self.key_entry, self.key_btn, self.pass_entry, self.pass_btn):
+            w.grid_remove()
+        if local:
+            self.key_label.config(text=f"Shared passphrase ({MIN_PASSPHRASE}+ characters). Use the same one on each machine.")
+            self.pass_entry.grid(row=2, column=0, sticky="we", pady=(2, 0))
+            self.pass_btn.grid(row=2, column=1, padx=(8, 0))
+        else:
+            self.key_label.config(text="Tiny-Web API key")
+            self.key_entry.grid(row=2, column=0, sticky="we", pady=(2, 0))
+            self.key_btn.grid(row=2, column=1, padx=(8, 0))
+
+    def generate_passphrase(self):
+        import secrets
+        words = ("amber", "anchor", "apple", "badger", "banjo", "beacon", "bramble", "cactus", "castle", "cobalt",
+                 "comet", "copper", "dingo", "ember", "falcon", "fern", "garnet", "harbour", "hazel", "island",
+                 "jigsaw", "kettle", "lantern", "lemon", "maple", "marble", "meadow", "nutmeg", "orbit", "otter",
+                 "pebble", "pepper", "piano", "quartz", "raven", "ribbon", "saffron", "tango", "thistle", "tulip",
+                 "velvet", "walnut", "willow", "yonder", "zephyr", "biscuit", "puffin", "saucer")
+        self.pass_var.set("-".join(secrets.choice(words) for _ in range(4)))
 
     def show_signup(self):
         tk, ttk = self.tk, self.ttk
@@ -1057,18 +1231,28 @@ class SettingsWindow:
         win.focus_force()
 
     def save(self):
+        mode = self.mode_var.get()
         key = self.key_var.get().strip()
+        passphrase = self.pass_var.get().strip()
         name = "".join(c for c in self.name_var.get().strip() if c.isalnum() or c in " .-_")[:64]
-        if not key:
-            self.messagebox.showerror("Clickboard", "Paste your Tiny-Web API key first.\nNo key yet? Click 'Get a free key'.")
+        if mode == "account" and not key:
+            self.messagebox.showerror("Clickboard", "Paste your Tiny-Web API key first.\nNo key yet? Click 'Get a free key',\nor choose 'Shared passphrase' to use Clickboard without an account.")
+            return
+        if mode == "local" and len(passphrase) < MIN_PASSPHRASE:
+            self.messagebox.showerror("Clickboard", f"Your passphrase needs at least {MIN_PASSPHRASE} characters.\n\nAnyone on the same network with the same passphrase can see your clipboard, so make it hard to guess. 'Generate' makes a good one.")
             return
         if not name:
             self.messagebox.showerror("Clickboard", "Give this machine a name.")
             return
-        self.app.cfg.api_key, self.app.cfg.name = key, name
-        self.app.cfg.save()
-        self.app.set_status("Checking in with Tiny-Web...")
-        self.app.wake.set()
+        cfg = self.app.cfg
+        changed = (mode, key, passphrase) != (cfg.mode, cfg.api_key, cfg.passphrase)
+        cfg.mode, cfg.api_key, cfg.passphrase, cfg.name = mode, key, passphrase, name
+        cfg.save()
+        self.app.set_status("Looking for your other machines..." if mode == "local" else "Checking in with Tiny-Web...")
+        if changed:
+            self.app.reset_for_mode_change()
+        else:
+            self.app.wake.set()
 
     def remove(self, device_id, name):
         if not self.messagebox.askyesno("Clickboard", f"Remove {name} from your Clickboard?\n\nIt will stop syncing immediately."):
@@ -1085,9 +1269,17 @@ class SettingsWindow:
         app = self.app
         plan = app.plan or {}
         line = app.status_line()
-        if plan:
+        if plan and app.cfg.mode == "account":
             line += f"\n{plan.get('name', 'Free')} plan \u00b7 {len(app.peers) + 1} of {plan.get('max_devices', '?')} machines in use"
+        elif app.cfg.mode == "local":
+            line += "\nLocal mode: machines on this network with the same passphrase connect automatically."
         self.status_var.set(line)
+        # Offer the no-account route when the key is the problem.
+        low = (app.status or "").lower()
+        if app.cfg.mode == "account" and app.warn and ("key" in low or "account" in low):
+            self.local_btn.grid(row=6, column=0, sticky="w", pady=(6, 0))
+        else:
+            self.local_btn.grid_remove()
 
         rows = [("this", app.cfg.name + " (this machine)", True)]
         for p in sorted(app.peers.values(), key=lambda d: d["name"].lower()):
@@ -1099,11 +1291,14 @@ class SettingsWindow:
                 child.destroy()
             for i, (pid, name, up) in enumerate(rows):
                 self.ttk.Label(self.list_frame, text=("\u25cf " if up else "\u25cb ") + name).grid(row=i, column=0, sticky="w", pady=2)
-                if pid != "this":
+                if pid != "this" and app.cfg.mode == "account":
                     self.ttk.Label(self.list_frame, text="connected" if up else "not connected",
                                    foreground="#0d9488" if up else "#999").grid(row=i, column=1, sticky="w", padx=12)
                     self.ttk.Button(self.list_frame, text="Remove",
                                     command=lambda d=pid, n=name: self.remove(d, n)).grid(row=i, column=2, sticky="e")
+                elif pid != "this":
+                    self.ttk.Label(self.list_frame, text="connected" if up else "not connected",
+                                   foreground="#0d9488" if up else "#999").grid(row=i, column=1, sticky="w", padx=12)
             self.list_frame.columnconfigure(1, weight=1)
         self.root.after(1000, self.tick)
 

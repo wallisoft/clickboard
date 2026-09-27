@@ -115,6 +115,7 @@ echo ""
 if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
     echo "==> Need sudo now: allowing Clickboard (TCP 47800) through the firewall"
     sudo ufw allow 47800/tcp comment 'Clickboard' >/dev/null
+    sudo ufw allow 47802/udp comment 'Clickboard local discovery' >/dev/null
 else
     echo "==> Firewall not active, nothing to open"
 fi
