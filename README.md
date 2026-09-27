@@ -22,22 +22,23 @@ No send dialogs, no shared folders. Just Ctrl+C here and Ctrl+V there.
 
 ### Linux (Ubuntu 24.04 and similar)
 
-Download `clickboard-latest.tar.gz` from [clickboard.eur.bz](https://clickboard.eur.bz), then:
-
 ```
-cd ~/Downloads && mkdir -p clickboard && tar xzf clickboard-latest.tar.gz -C clickboard && bash clickboard/install.sh
+curl -fsSL https://raw.githubusercontent.com/wallisoft/clickboard/main/install.sh | bash
 ```
 
 The installer asks for your password once, to add the clipboard and tray tools it needs and to open its ports if your firewall is on. Clickboard then starts automatically when you log in.
 
-### Windows 11
+### Windows 10 and 11
 
-A proper installer is on its way. Until then, install Python 3.12 from python.org, download this repository, and run:
+In PowerShell:
 
 ```
-py -m pip install -r requirements.txt
-py clickboard.py
+irm https://raw.githubusercontent.com/wallisoft/clickboard/main/install.ps1 | iex
 ```
+
+It installs Python if needed, sets Clickboard up in your user profile, adds it to the Start menu and to start at sign-in, and asks once for admin permission to open its ports on private networks.
+
+Run either command again at any time to update.
 
 ## How it works
 

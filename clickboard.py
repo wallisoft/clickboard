@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.4.0"
+VERSION = "2.5.1"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 SIGNUP_EMAIL = "signup@tiny-web.uk"        # fallbacks if signup-info.php is unreachable
@@ -74,8 +74,24 @@ COLOUR_OFF = (249, 115, 22, 255)      # orange: not connected (or needs attentio
 COLOUR_PAUSED = (249, 115, 22, 255)   # orange too: paused by you (menu says which)
 
 
+LOG_FILE = CONFIG_DIR / "clickboard.log"
+
+
 def log(msg):
-    print(f"[clickboard {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+    line = f"[clickboard {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    if sys.stderr:                       # None when running windowless (pythonw on Windows)
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1_000_000:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".log.old"))
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 # -- Config ------------------------------------------------------------------
@@ -385,8 +401,113 @@ def local_key(passphrase: str) -> bytes:
                           n=2 ** 14, r=8, p=1, dklen=32)
 
 
+class WindowsBackend:
+    """Windows clipboard via pywin32: text, images (PNG and bitmap) and Explorer files."""
+
+    def __init__(self):
+        import win32clipboard
+        import win32con
+        self.wc, self.con = win32clipboard, win32con
+        self.CF_PNG = win32clipboard.RegisterClipboardFormat("PNG")
+        self.CF_DROPEFFECT = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
+        self._last_seq = None
+
+    def _open(self):
+        for _ in range(20):          # another app may briefly hold the clipboard
+            try:
+                self.wc.OpenClipboard()
+                return True
+            except Exception:
+                time.sleep(0.05)
+        return False
+
+    def read_if_changed(self):
+        seq = self.wc.GetClipboardSequenceNumber()     # Windows counts every change for us
+        if seq == self._last_seq:
+            return None
+        if not self._open():
+            return None                                # retry next poll
+        self._last_seq = seq
+        want_image = False
+        try:
+            if self.wc.IsClipboardFormatAvailable(self.con.CF_HDROP):
+                paths = [p for p in self.wc.GetClipboardData(self.con.CF_HDROP) if os.path.exists(p)]
+                if paths:
+                    return Clip("files", paths=list(paths))
+            if self.wc.IsClipboardFormatAvailable(self.CF_PNG):
+                data = self.wc.GetClipboardData(self.CF_PNG)
+                if data:
+                    return Clip("image", png=bytes(data))
+            if self.wc.IsClipboardFormatAvailable(self.con.CF_DIB):
+                want_image = True
+            elif self.wc.IsClipboardFormatAvailable(self.con.CF_UNICODETEXT):
+                return Clip("text", text=self.wc.GetClipboardData(self.con.CF_UNICODETEXT))
+        except Exception as exc:
+            log(f"clipboard read failed: {exc}")
+            return None
+        finally:
+            try:
+                self.wc.CloseClipboard()
+            except Exception:
+                pass
+        if want_image:
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grabclipboard()      # decodes Windows bitmaps for us
+                if isinstance(img, Image.Image):
+                    out = io.BytesIO()
+                    img.save(out, "PNG")
+                    return Clip("image", png=out.getvalue())
+            except Exception as exc:
+                log(f"couldn't read clipboard image: {exc}")
+        return None
+
+    def _write(self, fill):
+        if not self._open():
+            log("clipboard busy, couldn't write")
+            return
+        try:
+            self.wc.EmptyClipboard()
+            fill()
+        finally:
+            self.wc.CloseClipboard()
+        self._last_seq = self.wc.GetClipboardSequenceNumber()
+
+    def write_text(self, text):
+        self._write(lambda: self.wc.SetClipboardText(text, self.con.CF_UNICODETEXT))
+
+    def write_image(self, png):
+        img = Image.open(io.BytesIO(png))
+        bmp = io.BytesIO()
+        img.convert("RGB").save(bmp, "BMP")
+        dib = bmp.getvalue()[14:]                      # a DIB is a .bmp without its file header
+
+        def fill():
+            self.wc.SetClipboardData(self.con.CF_DIB, dib)
+            self.wc.SetClipboardData(self.CF_PNG, png)  # lossless copy for apps that want PNG
+        self._write(fill)
+
+    def write_files(self, paths):
+        # DROPFILES header: offset to file list (20), drop point (0,0), fNC=0, fWide=1 (UTF-16)
+        header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+        body = ("\0".join(str(p) for p in paths) + "\0\0").encode("utf-16-le")
+
+        def fill():
+            self.wc.SetClipboardData(self.con.CF_HDROP, header + body)
+            self.wc.SetClipboardData(self.CF_DROPEFFECT, struct.pack("<I", 1))   # 1 = copy, not move
+        self._write(fill)
+
+
 def make_backend():
-    return LinuxBackend() if platform.system() == "Linux" else TextOnlyBackend()
+    system = platform.system()
+    if system == "Linux":
+        return LinuxBackend()
+    if system == "Windows":
+        try:
+            return WindowsBackend()
+        except ImportError:
+            log("pywin32 not installed: syncing text only")
+    return TextOnlyBackend()
 
 
 def human_size(n: int) -> str:
@@ -421,6 +542,13 @@ def signup_info() -> dict:
 
 
 # -- Wire protocol: [4-byte header length][JSON header][payload bytes] -------
+
+def reuse_or_exclusive(sock):
+    if platform.system() == "Windows":
+        sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
 
 def recv_exact(sock, n: int) -> bytes:
     buf = bytearray()
@@ -640,7 +768,7 @@ class App:
     def beacon_listen_loop(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reuse_or_exclusive(s)
             s.bind(("", BEACON_PORT))
         except OSError as exc:
             log(f"local discovery unavailable: {exc}")
@@ -669,7 +797,7 @@ class App:
     def serve(self):
         try:
             ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reuse_or_exclusive(ls)
             ls.bind(("0.0.0.0", self.cfg.port))
             ls.listen(8)
         except OSError as exc:
@@ -823,7 +951,7 @@ class App:
 
     def _send_files(self, link, paths, total):
         fid = str(uuid.uuid4())
-        link.send({"type": "files_begin", "id": fid, "items": [os.path.basename(p.rstrip("/")) for p in paths],
+        link.send({"type": "files_begin", "id": fid, "items": [os.path.basename(p.rstrip("/\\")) for p in paths],
                    "total": total})
 
         def send_file(full, rel):
@@ -841,14 +969,14 @@ class App:
                 log(f"skipped {full}: {exc}")
 
         for p in paths:
-            p = p.rstrip("/")
+            p = p.rstrip("/\\")
             base = os.path.dirname(p)
             if os.path.isdir(p):
                 for root, dirs, files in os.walk(p):
-                    rel_root = os.path.relpath(root, base)
+                    rel_root = os.path.relpath(root, base).replace(os.sep, "/")
                     link.send({"type": "dir", "id": fid, "path": rel_root})
                     for f in files:
-                        send_file(os.path.join(root, f), os.path.join(rel_root, f))
+                        send_file(os.path.join(root, f), rel_root + "/" + f)
             elif os.path.isfile(p):
                 send_file(p, os.path.basename(p))
         link.send({"type": "files_end", "id": fid})
@@ -1006,7 +1134,7 @@ class App:
     def control_loop(self):
         try:
             cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            cs.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            reuse_or_exclusive(cs)
             cs.bind(("127.0.0.1", CONTROL_PORT))
             cs.listen(4)
         except OSError as exc:
@@ -1204,7 +1332,7 @@ class SettingsWindow:
             if var is not None:
                 box = ttk.Frame(frame)
                 box.grid(row=row + 2, column=1, sticky="w", pady=(4, 12))
-                ttk.Entry(box, textvariable=var, width=26, state="readonly", font=("monospace", 11)).pack(side="left")
+                ttk.Entry(box, textvariable=var, width=26, state="readonly", font="TkFixedFont").pack(side="left")
                 ttk.Button(box, text="Copy", command=lambda: copy(var.get())).pack(side="left", padx=6)
                 if button:
                     ttk.Button(box, text=button[0], command=button[1]).pack(side="left")
