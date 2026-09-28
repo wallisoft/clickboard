@@ -72,10 +72,34 @@ jobs:
       - name: Build Clickboard-Setup.exe
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.check.outputs.version }}" packaging\clickboard.iss
+      - name: Build Clickboard.msix (Microsoft Store)
+        # Switches itself on once the Store identity is added as repository variables
+        # (Settings > Secrets and variables > Actions > Variables).
+        if: ${{ vars.MSIX_IDENTITY_NAME != '' }}
+        env:
+          ID_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+          PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY }}
+        run: |
+          $ver = "${{ needs.check.outputs.version }}.0"
+          New-Item -ItemType Directory -Force msix\Assets | Out-Null
+          Copy-Item dist\Clickboard.exe msix\
+          python -c "from PIL import Image, ImageDraw; [ (lambda n,sz: (lambda im,d: (d.ellipse((sz*0.08,sz*0.08,sz*0.92,sz*0.92),fill=(34,197,94,255)), im.save('msix/Assets/'+n)))(*(lambda im: (im, ImageDraw.Draw(im)))(Image.new('RGBA',(sz,sz),(0,0,0,0)))))(n,sz) for n,sz in (('Square44x44Logo.png',44),('Square150x150Logo.png',150),('StoreLogo.png',50)) ]"
+          (Get-Content packaging\AppxManifest.xml -Raw) `
+            -replace '@VERSION@', $ver `
+            -replace '@IDENTITY_NAME@', $env:ID_NAME `
+            -replace '@PUBLISHER@', $env:PUBLISHER `
+            -replace '@PUBLISHER_DISPLAY@', $env:PUBLISHER_DISPLAY |
+            Set-Content msix\AppxManifest.xml -Encoding UTF8
+          $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          & $mk.FullName pack /d msix /p Clickboard.msix /o
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: packaging/Output/Clickboard-Setup.exe
+          if-no-files-found: ignore
+          path: |
+            packaging/Output/Clickboard-Setup.exe
+            Clickboard.msix
 
   release:
     needs: [check, linux, windows]
@@ -91,3 +115,4 @@ jobs:
           files: |
             clickboard-linux.tar.gz
             Clickboard-Setup.exe
+            Clickboard.msix
