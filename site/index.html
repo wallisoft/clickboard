@@ -190,26 +190,36 @@ section[id]{scroll-margin-top:76px}
 <section class="tw-section" id="install">
     <div class="cb-wrap cb-center">
         <h2>Install</h2>
-        <p class="cb-lead">Ubuntu 24.04 and similar. Download the package, then run the command below in a terminal.</p>
-        <a href="https://drive.google.com/uc?export=download&amp;id=1dVVqly5LGdfXshmj2RINPUdzVNn-bGSi" class="cb-btn">Download clickboard-latest.tar.gz</a>
+        <p class="cb-lead">One command. It installs everything Clickboard needs, and starts it when you log in. Run it again any time to update.</p>
         <div class="install-box">
+            <h3 style="font-size:15px;margin:0 0 8px">Linux <span style="font-weight:400;color:#6b7280">(Ubuntu 24.04 and similar, in a terminal)</span></h3>
             <div class="code-block">
-                <code id="install-cmd">cd ~/Downloads &amp;&amp; mkdir -p clickboard &amp;&amp; tar xzf clickboard-latest.tar.gz -C clickboard &amp;&amp; bash clickboard/install.sh</code>
-                <button class="copy-btn" id="copy-btn">Copy</button>
+                <code id="cmd-linux">curl -fsSL https://raw.githubusercontent.com/wallisoft/clickboard/main/install.sh | bash</code>
+                <button class="copy-btn" data-copy="cmd-linux">Copy</button>
             </div>
-            <p class="install-note">The installer asks for your password once, to add the clipboard and network tools it needs. Then run <strong>clickboard</strong>, or find it in your app launcher.</p>
+            <p class="install-note">Asks for your password once, to add the clipboard and tray tools it needs and open its ports if your firewall is on.</p>
+
+            <h3 style="font-size:15px;margin:28px 0 8px">Windows 10 and 11 <span style="font-weight:400;color:#6b7280">(in PowerShell)</span></h3>
+            <div class="code-block">
+                <code id="cmd-windows">irm https://raw.githubusercontent.com/wallisoft/clickboard/main/install.ps1 | iex</code>
+                <button class="copy-btn" data-copy="cmd-windows">Copy</button>
+            </div>
+            <p class="install-note">Installs Python if needed, adds Clickboard to your Start menu, and asks once for permission to open its ports on private networks.</p>
+
+            <p class="install-note">Prefer to read before you run? Both installers are on <a href="https://github.com/wallisoft/clickboard">GitHub</a>.</p>
         </div>
         <p class="privacy">Your key is used only to confirm which machines belong to you. We store each machine's name, its network address and its public key, and nothing you copy.</p>
     </div>
 </section>
 
 <script>
-document.getElementById('copy-btn').addEventListener('click', function () {
-    var btn = this;
-    var cmd = document.getElementById('install-cmd').textContent;
-    navigator.clipboard.writeText(cmd).then(function () {
-        btn.textContent = 'Copied!';
-        setTimeout(function () { btn.textContent = 'Copy'; }, 1800);
+document.querySelectorAll('.copy-btn[data-copy]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+        var cmd = document.getElementById(btn.dataset.copy).textContent;
+        navigator.clipboard.writeText(cmd).then(function () {
+            btn.textContent = 'Copied!';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1800);
+        });
     });
 });
 </script>
