@@ -199,12 +199,14 @@ section[id]{scroll-margin-top:76px}
             </div>
             <p class="install-note">Asks for your password once, to add the clipboard and tray tools it needs and open its ports if your firewall is on.</p>
 
-            <h3 style="font-size:15px;margin:28px 0 8px">Windows 10 and 11 <span style="font-weight:400;color:#6b7280">(in PowerShell)</span></h3>
+            <h3 style="font-size:15px;margin:28px 0 8px">Windows 10 and 11</h3>
+            <p style="margin:0 0 4px"><a href="https://github.com/wallisoft/clickboard/releases/latest/download/Clickboard-Setup.exe" class="cb-btn" style="margin-top:8px">Download for Windows</a></p>
+            <p class="install-note">Run <strong>Clickboard-Setup.exe</strong> and follow the steps. Until our Microsoft Store listing arrives, Windows may say <em>"Windows protected your PC"</em>: click <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+            <p class="install-note" style="margin-top:14px">Prefer the command line? In PowerShell:</p>
             <div class="code-block">
                 <code id="cmd-windows">irm https://raw.githubusercontent.com/wallisoft/clickboard/main/install.ps1 | iex</code>
                 <button class="copy-btn" data-copy="cmd-windows">Copy</button>
             </div>
-            <p class="install-note">Installs Python if needed, adds Clickboard to your Start menu, and asks once for permission to open its ports on private networks.</p>
 
             <p class="install-note">Prefer to read before you run? Both installers are on <a href="https://github.com/wallisoft/clickboard">GitHub</a>.</p>
         </div>
