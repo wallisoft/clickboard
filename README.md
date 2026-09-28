@@ -60,7 +60,7 @@ Tiny-Web stores each machine's name, local network address and public certificat
 
 Clickboard is **free for individuals and small businesses** under the [PolyForm Small Business License 1.0.0](LICENSE). Larger organisations need a commercial licence: see [COMMERCIAL.md](COMMERCIAL.md).
 
-The source is open to read, and contributions are welcome. A macOS port would be especially lovely.
+The source is open to read, and contributions are welcome. A macOS port would be especially lovely. See [CONTRIBUTING.md](CONTRIBUTING.md): contributors sign a short [CLA](CLA.md), because Wallisoft also builds commercial products on Clickboard's core.
 
 ---
 
