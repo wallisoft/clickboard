@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 API_BASE = "https://tiny-web.uk/api/"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 SIGNUP_EMAIL = "signup@tiny-web.uk"        # fallbacks if signup-info.php is unreachable
@@ -301,8 +301,9 @@ class LinuxBackend:
                 token = ("ts", ts)
         if token is None:
             token = ("targets", tuple(sorted(t)))
-        if token[0] == "ts" and token == self._last_token:
-            return None
+        # Don't trust an unchanged TIMESTAMP to mean "nothing changed": some apps keep
+        # ownership and just swap the contents. Text is cheap to re-read every poll;
+        # only large images are throttled.
         changed_token = token != self._last_token
         self._last_token = token
 
@@ -323,8 +324,8 @@ class LinuxBackend:
                 return Clip("files", paths=paths)
         img_type = next((x for x in IMAGE_TYPES if x in t), None)
         if img_type:
-            # No usable change timestamp: re-read the image at most every 2 seconds.
-            if token[0] == "targets" and not changed_token and time.time() - self._last_image_read < 2:
+            # Same owner as last time: re-read the image at most every 2 seconds.
+            if not changed_token and time.time() - self._last_image_read < 2:
                 return None
             self._last_image_read = time.time()
             data = self._get(img_type, timeout=10)

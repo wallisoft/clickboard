@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-PACKAGE_URL="${CLICKBOARD_PACKAGE_URL:-https://github.com/wallisoft/clickboard/archive/refs/heads/main.tar.gz}"
+PACKAGE_URL="${CLICKBOARD_PACKAGE_URL:-https://github.com/wallisoft/clickboard/releases/latest/download/clickboard-linux.tar.gz}"
 PROJECT_DIR="$HOME/projects/clickboard"
 BIN_SHIM="$HOME/bin/clickboard"
 SOURCE_FILES=(clickboard.py requirements.txt clickboard.desktop)
@@ -63,7 +63,7 @@ else
     echo "==> Downloading and extracting the package"
     tmp_pkg="$(mktemp /tmp/clickboard-package.XXXXXX.tar.gz)"
     curl -fsSL "$PACKAGE_URL" -o "$tmp_pkg"
-    tar xzf "$tmp_pkg" -C "$PROJECT_DIR" --strip-components=1
+    tar xzf "$tmp_pkg" -C "$PROJECT_DIR"
     rm -f "$tmp_pkg"
 fi
 
