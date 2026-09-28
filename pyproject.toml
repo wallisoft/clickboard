@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clickboard-core"
+version = "1.0.1"
+description = "The engine behind Clickboard: machine discovery, mutual TLS links and clipboard sync"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Wallisoft" }]
+dependencies = [
+    "pillow",
+    "pyperclip",
+    "cryptography",
+    "pywin32; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://clickboard.eur.bz"
+Source = "https://github.com/wallisoft/clickboard"
+
+[tool.setuptools]
+packages = ["clickboard_core"]

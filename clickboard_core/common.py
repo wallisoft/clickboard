@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-CORE_VERSION = "1.0.0"
+CORE_VERSION = "1.0.1"
 
 API_BASE = "https://tiny-web.uk/api/"
 DEFAULT_PORT = 47800      # TCP: machine-to-machine TLS

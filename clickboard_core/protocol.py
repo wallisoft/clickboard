@@ -51,6 +51,11 @@ class Link:
         self.initiator = initiator
         self.alive = True
         self.rx = {}   # per-link state for features, e.g. incoming file transfers
+        try:
+            # Send small messages (e.g. mouse movements) immediately rather than batching them.
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         self._send_lock = threading.Lock()
 
     def send(self, header: dict, payload: bytes = b""):
