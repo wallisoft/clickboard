@@ -20,7 +20,7 @@ from clickboard_core.protocol import reuse_or_exclusive
 from clickboard_core import (MIN_PASSPHRASE, SIGNUP_EMAIL, ClipboardSync, Config, Mesh,
                              log, set_app, signup_info)
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 SIGNUP_URL = "https://clickboard.eur.bz/#signup"
 CONTROL_PORT = 47801      # localhost only: lets the launcher talk to a running copy
 
