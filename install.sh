@@ -51,6 +51,7 @@ have_local_source=1
 for f in "${SOURCE_FILES[@]}"; do
     [ -f "$src_dir/$f" ] || have_local_source=0
 done
+[ -d "$src_dir/clickboard_core" ] || have_local_source=0
 
 if [ "$src_dir" = "$PROJECT_DIR" ]; then
     echo "==> Running from the install directory itself, using files in place"
@@ -59,6 +60,8 @@ elif [ "$have_local_source" -eq 1 ]; then
     for f in "${SOURCE_FILES[@]}"; do
         cp "$src_dir/$f" "$PROJECT_DIR/"
     done
+    rm -rf "$PROJECT_DIR/clickboard_core"
+    cp -r "$src_dir/clickboard_core" "$PROJECT_DIR/"
 else
     echo "==> Downloading and extracting the package"
     tmp_pkg="$(mktemp /tmp/clickboard-package.XXXXXX.tar.gz)"
@@ -73,6 +76,10 @@ for f in "${SOURCE_FILES[@]}"; do
         exit 1
     fi
 done
+if [ ! -d "$PROJECT_DIR/clickboard_core" ]; then
+    echo "Missing clickboard_core in $PROJECT_DIR - the package looks incomplete." >&2
+    exit 1
+fi
 chmod +x "$PROJECT_DIR/clickboard.py"
 
 # --- System packages --------------------------------------------------------

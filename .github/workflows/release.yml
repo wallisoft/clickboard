@@ -38,8 +38,9 @@ jobs:
       - name: Build package
         run: |
           python3 -m py_compile clickboard.py
+          python3 -m compileall -q clickboard_core
           bash -n install.sh
-          tar czf clickboard-linux.tar.gz install.sh clickboard.py requirements.txt clickboard.desktop README.md LICENSE
+          tar czf clickboard-linux.tar.gz --exclude=__pycache__ install.sh clickboard.py clickboard_core requirements.txt clickboard.desktop README.md LICENSE
       - uses: actions/upload-artifact@v4
         with:
           name: linux
