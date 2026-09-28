@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v2.5.1 and this builds the Linux package and the Windows
+# installer, then publishes both as a GitHub Release. The tag must match
+# VERSION in clickboard.py, so a release can never be mislabelled.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Tag must match VERSION in clickboard.py
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CODE=$(grep -m1 '^VERSION' clickboard.py | cut -d'"' -f2)
+          echo "tag=$TAG code=$CODE"
+          if [ "$TAG" != "$CODE" ]; then
+            echo "::error::Tag v$TAG doesn't match VERSION $CODE in clickboard.py"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build package
+        run: |
+          python3 -m py_compile clickboard.py
+          bash -n install.sh
+          tar czf clickboard-linux.tar.gz install.sh clickboard.py requirements.txt clickboard.desktop README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: clickboard-linux.tar.gz
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          choco install innosetup -y --no-progress
+      - name: Make the app icon (the green status dot)
+        run: |
+          python -c "from PIL import Image, ImageDraw; im=Image.new('RGBA',(256,256),(0,0,0,0)); d=ImageDraw.Draw(im); d.ellipse((24,24,232,232),fill=(34,197,94,255),outline=(255,255,255,220),width=12); im.save('packaging/clickboard.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Build Clickboard.exe
+        run: |
+          pyinstaller --noconfirm --onefile --noconsole --name Clickboard `
+            --icon packaging/clickboard.ico `
+            --hidden-import pystray._win32 `
+            --hidden-import win32clipboard --hidden-import win32con `
+            --hidden-import PIL.ImageGrab `
+            clickboard.py
+      - name: Build Clickboard-Setup.exe
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ needs.check.outputs.version }}" packaging\clickboard.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: packaging/Output/Clickboard-Setup.exe
+
+  release:
+    needs: [check, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Clickboard ${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          files: |
+            clickboard-linux.tar.gz
+            Clickboard-Setup.exe
